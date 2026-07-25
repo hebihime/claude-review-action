@@ -1,3 +1,7 @@
+# Session handoff notes for Claude Code — local working state, not part of the
+# published action. Auto-loaded at session start so it survives /compact.
+CLAUDE.md
+
 node_modules/
 lib/
 coverage/
