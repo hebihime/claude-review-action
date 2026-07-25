@@ -1,0 +1,213 @@
+# claude-review-action — assembled prompt (provider: dry-run)
+
+Model that would be called: claude-haiku-4-5
+Tool that would be forced:  report_findings
+
+## System prompt
+
+You are a meticulous code reviewer running as a GitHub Action on a pull request. You see only the changed lines of each file, never the whole repository.
+
+Review the diff against the rules below and against nothing else. Each rule's description defines what counts as a finding for that rule. An observation that does not fall under one of these rules is not a finding, however true it is.
+
+RULES
+
+- correctness (error): Logic that does not do what the surrounding code and names claim: off-by-one errors, inverted conditions, unhandled null or undefined, missing await, resources that are never released.
+- security (error): Untrusted input reaching a sensitive sink (shell, SQL, filesystem path, HTML), credentials in source or logs, and missing authorization checks on a code path that needs one.
+- error-handling (warn): Failures that are swallowed, logged and then ignored, or re-thrown without enough context to act on. Empty catch blocks and unchecked error returns count.
+- test-coverage (warn): New branching logic or a bug fix that arrives with no test exercising it. Do not raise this for pure refactors or generated code.
+- clarity (nit): Names, comments, or control flow that will mislead the next reader. Only raise this when you can name a concrete alternative.
+
+HOW TO REPORT
+
+Call the report_findings tool exactly once. An empty findings list is a normal and common outcome — a clean diff is not a failure to find something.
+
+Every finding anchors to a line that is visible in the diff. Each line is printed with its number in the file as it will exist after this pull request:
+
+    42 |+  const total = items.length
+       |-  const total = items.count
+    43 |   return total
+
+Use that number as `line`. "+" marks an added line, "-" a removed line, and a space an unchanged line included for context. A line with a blank gutter was removed and cannot be commented on: anchor to the nearest numbered line instead and say in the message that the problem is in the removed code.
+
+Copy `path` exactly from the "### " header above each diff, and `rule_id` exactly from the rules list.
+
+WRITING THE MESSAGE
+
+Address the author directly. Say what is wrong and what it will cause, in one to three sentences. No preamble, no restating the code back, no praise.
+
+Include `suggestion` only when you can write the corrected source for the line you cited. It is offered to the author as a committable change, so it must be code alone — no diff markers, no commentary. Omit it when the fix spans more code than you can see or needs a judgement call.
+
+WHAT NOT TO REPORT
+
+- Anything a formatter or linter already enforces.
+- Speculation about code you cannot see. When correctness depends on a function whose body is not in the diff, assume it does what its name says.
+- Pre-existing problems on unchanged context lines, unless this pull request makes them materially worse.
+- The same problem twice. Report it once, at its cause.
+
+Prefer fewer, higher-confidence findings. A wrong finding costs the author more time than a missed one costs the project.
+
+## User message
+
+Pull request #1 in hebihime/claude-review-sandbox: Add a duration parser
+Merging into: main
+
+2 file(s) follow. These diffs are everything you can see.
+
+### src/matrix.ts
+
+@@ -0,0 +1,90 @@
+     1 |+export type Matrix = readonly (readonly number[])[]
+     2 |+
+     3 |+export class DimensionError extends Error {
+     4 |+  constructor(message: string) {
+     5 |+    super(message)
+     6 |+    this.name = 'DimensionError'
+     7 |+  }
+     8 |+}
+     9 |+
+    10 |+export function rows(matrix: Matrix): number {
+    11 |+  return matrix.length
+    12 |+}
+    13 |+
+    14 |+export function columns(matrix: Matrix): number {
+    15 |+  return matrix[0]?.length ?? 0
+    16 |+}
+    17 |+
+    18 |+export function isRectangular(matrix: Matrix): boolean {
+    19 |+  const width = columns(matrix)
+    20 |+  return matrix.every(row => row.length === width)
+    21 |+}
+    22 |+
+    23 |+function assertRectangular(matrix: Matrix, label: string): void {
+    24 |+  if (!isRectangular(matrix)) {
+    25 |+    throw new DimensionError(`${label} is ragged: every row must have the same length`)
+    26 |+  }
+    27 |+}
+    28 |+
+    29 |+export function identity(size: number): number[][] {
+    30 |+  if (size < 0) throw new DimensionError(`identity size must not be negative, got ${size}`)
+    31 |+  return Array.from({ length: size }, (_, row) =>
+    32 |+    Array.from({ length: size }, (_, column) => (row === column ? 1 : 0))
+    33 |+  )
+    34 |+}
+    35 |+
+    36 |+export function transpose(matrix: Matrix): number[][] {
+    37 |+  assertRectangular(matrix, 'matrix')
+    38 |+  return Array.from({ length: columns(matrix) }, (_, column) =>
+    39 |+    Array.from({ length: rows(matrix) }, (_, row) => matrix[row]![column]!)
+    40 |+  )
+    41 |+}
+    42 |+
+    43 |+export function add(left: Matrix, right: Matrix): number[][] {
+    44 |+  assertRectangular(left, 'left')
+    45 |+  assertRectangular(right, 'right')
+    46 |+  if (rows(left) !== rows(right) || columns(left) !== columns(right)) {
+    47 |+    throw new DimensionError(
+    48 |+      `cannot add a ${rows(left)}x${columns(left)} matrix to a ${rows(right)}x${columns(right)} matrix`
+    49 |+    )
+    50 |+  }
+    51 |+  return left.map((row, rowIndex) => row.map((value, column) => value + right[rowIndex]![column]!))
+    52 |+}
+    53 |+
+    54 |+export function scale(matrix: Matrix, factor: number): number[][] {
+    55 |+  return matrix.map(row => row.map(value => value * factor))
+    56 |+}
+    57 |+
+    58 |+export function multiply(left: Matrix, right: Matrix): number[][] {
+    59 |+  assertRectangular(left, 'left')
+    60 |+  assertRectangular(right, 'right')
+    61 |+  if (columns(left) !== rows(right)) {
+    62 |+    throw new DimensionError(
+    63 |+      `cannot multiply a ${rows(left)}x${columns(left)} matrix by a ${rows(right)}x${columns(right)} matrix`
+    64 |+    )
+    65 |+  }
+    66 |+  const inner = columns(left)
+    67 |+  return Array.from({ length: rows(left) }, (_, row) =>
+    68 |+    Array.from({ length: columns(right) }, (_, column) => {
+    69 |+      let total = 0
+    70 |+      for (let index = 0; index < inner; index++) {
+    71 |+        total += left[row]![index]! * right[index]![column]!
+    72 |+      }
+    73 |+      return total
+    74 |+    })
+    75 |+  )
+    76 |+}
+    77 |+
+    78 |+export function trace(matrix: Matrix): number {
+    79 |+  assertRectangular(matrix, 'matrix')
+    80 |+  if (rows(matrix) !== columns(matrix)) {
+    81 |+    throw new DimensionError(`trace requires a square matrix, got ${rows(matrix)}x${columns(matrix)}`)
+    82 |+  }
+    83 |+  return matrix.reduce((total, row, index) => total + row[index]!, 0)
+    84 |+}
+    85 |+
+    86 |+export function format(matrix: Matrix): string {
+    87 |+  const cells = matrix.map(row => row.map(value => String(value)))
+    88 |+  const width = Math.max(0, ...cells.flat().map(cell => cell.length))
+    89 |+  return cells.map(row => row.map(cell => cell.padStart(width)).join(' ')).join('\n')
+    90 |+}
+
+### src/slug.ts
+
+@@ -0,0 +1 @@
+     1 |+export const slug = (input: string): string => input.toLowerCase().replace(/[^a-z0-9]+/g, '-')
+
+## Tool schema
+
+{
+  "name": "report_findings",
+  "description": "Report every code review finding for this pull request. Call this exactly once. Call it with an empty findings list when the diff is clean.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "findings": {
+        "type": "array",
+        "description": "Every finding, in any order. Empty when there is nothing to report.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "The file path exactly as it appears in the \"### \" header above the diff."
+            },
+            "line": {
+              "type": "integer",
+              "description": "A line number from the gutter of that file's diff. Must be a number that is actually printed; lines with a blank gutter were removed and cannot be commented on."
+            },
+            "severity": {
+              "type": "string",
+              "enum": [
+                "nit",
+                "warn",
+                "error"
+              ],
+              "description": "How serious this specific instance is."
+            },
+            "rule_id": {
+              "type": "string",
+              "description": "The id of the rule this finding falls under, copied exactly from the rules list."
+            },
+            "message": {
+              "type": "string",
+              "description": "One to three sentences addressed to the pull request author: what is wrong, and what it will cause."
+            },
+            "suggestion": {
+              "type": "string",
+              "description": "Optional replacement source for the cited line, with no diff markers and no explanation. Include only when you can write the corrected code."
+            }
+          },
+          "required": [
+            "path",
+            "line",
+            "severity",
+            "rule_id",
+            "message"
+          ]
+        }
+      }
+    },
+    "required": [
+      "findings"
+    ]
+  }
+}

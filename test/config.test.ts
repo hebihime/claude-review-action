@@ -202,4 +202,14 @@ describe('the example config shipped in this repo', () => {
     expect(loaded.config.rules).toEqual(DEFAULT_RULES)
     expect(loaded.config.model).toBe(DEFAULT_MODEL)
   })
+
+  it('is value-for-value identical to running with no config file at all', () => {
+    // The README says deleting the file changes nothing. Comparing the whole
+    // object rather than a few keys is what makes that sentence true: a default
+    // changed in the schema and not in the example — or the reverse — fails here
+    // instead of surprising someone who copied the example and expected the
+    // documented behaviour.
+    const shipped = loadConfig(DEFAULT_CONFIG_PATH, process.cwd()).config
+    expect(shipped).toEqual(parseConfig(''))
+  })
 })

@@ -5,23 +5,17 @@
 
 Opinionated, configurable AI code review on every pull request — with idempotent comments and a cost readout.
 
-> **Status: milestone 5 of 6.** The review is feature-complete: the action loads and validates
-> `.claude-review.yml`, fetches the diff, decides what fits the token budget, asks the model for
-> findings through a forced tool call, maps each finding onto a line a comment can actually anchor
-> to, posts them as inline review comments that update in place on every re-run, and closes with a
-> single summary comment carrying the verdict, what was skipped, and what the run cost. Milestone 6
-> is documentation, dogfooding and the tagged release.
+The action loads and validates `.claude-review.yml`, fetches the diff, decides what fits the token
+budget, asks the model for findings through a forced tool call, maps each finding onto a line a
+comment can actually anchor to, posts them as inline review comments that update in place on every
+re-run, and closes with a single summary comment carrying the verdict, what was skipped, and what the
+run cost.
 
-## Build order
+Every claim in this README that says "verified" is backed by output from a run on a GitHub-hosted
+runner, and [`examples/`](examples/) contains the artefacts. The one thing this project has never
+done is call the Anthropic API — see [Where the review text comes from](#where-the-review-text-comes-from).
 
-| # | Milestone | State |
-|---|-----------|-------|
-| 1 | Scaffold, `action.yml`, ncc build, hello-world run | ✅ done |
-| 2 | Config loading + validation, diff fetching, ignore/budget logic | ✅ done |
-| 3 | Model review call, structured findings, diff→position mapping | ✅ done |
-| 4 | Inline comments + idempotent update logic | ✅ done |
-| 5 | Summary comment, verdict, cost readout | ✅ done |
-| 6 | Tests green, full README, tag `v1` | ⬜ next |
+**Released as `v1`.** See [Versioning](#versioning) for what to pin.
 
 ## Inputs
 
@@ -88,6 +82,8 @@ the built-in defaults exactly, so copying it is a safe starting point.
 | `model` | string | `claude-haiku-4-5` | Any Claude model id. `claude-sonnet-5` is the upgrade for deeper review. |
 | `provider` | `anthropic`\|`dry-run`\|`fixture` | `anthropic` | Where the review call goes — see below. |
 | `base_url` | URL | — | Gateway, Bedrock, or Vertex endpoint. |
+| `fixture_path` | string | — | Findings JSON to replay. Required by `provider: fixture`, ignored otherwise. |
+| `dry_run_path` | string | `claude-review-prompt.txt` | Where `provider: dry-run` writes the assembled prompt. |
 | `verdict.request_changes_on` | `error`\|`warn` | `error` | Severity that turns the verdict into REQUEST CHANGES. |
 | `verdict.approve_when_clean` | boolean | `true` | Post APPROVE rather than COMMENT when nothing was found. |
 | `fail_on_request_changes` | boolean | `false` | Whether a REQUEST CHANGES verdict fails the check run. |
@@ -240,7 +236,9 @@ Details that matter:
 
 ## The summary comment
 
-Every run ends with exactly one comment on the pull request describing the run itself:
+Every run ends with exactly one comment on the pull request describing the run itself. Below is the
+shape, with every optional section populated at once so they are all visible; two summaries copied
+verbatim off real pull requests are in [`examples/`](examples/).
 
 ```markdown
 <!-- claude-review:v1:summary -->
@@ -287,10 +285,8 @@ Design notes:
 
 - **It is an issue comment, not a review comment.** It is about the pull request as a whole and has
   no line to anchor to, so it belongs in the conversation timeline where the author will see it.
-- **The verdict is a header, not a GitHub review event.** The action never submits an approval. A bot
-  approval can satisfy a required-review rule and let a human review be skipped entirely, which is a
-  worse outcome than any review this action could produce. `fail_on_request_changes: true` is the
-  opt-in for making the verdict actually block a merge, via the check run rather than the review.
+- **The verdict is a header, not a GitHub review event.** The action never submits an approval or a
+  formal changes-requested review — see [below](#the-verdict-and-why-it-does-not-block-your-merge).
 - **Its idempotency rule is the mirror image of the inline comments'.** An inline comment body must be
   a pure function of its finding, so a re-run rewrites nothing. The summary deliberately carries what
   changed about the *run* — token counts, cost, the link to this workflow run — so a re-run is
@@ -305,6 +301,29 @@ Design notes:
   workflow runs, and both can list the comments before either creates one. The *oldest* live summary
   wins every time — never the newest, or the survivor would change on every run — and the duplicate is
   folded away and collapsed rather than deleted, because it may already have replies.
+
+## The verdict, and why it does not block your merge
+
+The verdict is `approve`, `comment`, or `request_changes`, derived from the findings that survived
+`min_severity_to_comment` — including the ones `max_comments` held back, because a display cap is not
+a judgement that a finding was unimportant. `verdict.request_changes_on` picks the severity that
+triggers REQUEST CHANGES; `verdict.approve_when_clean: false` turns a clean run into COMMENT instead
+of APPROVE.
+
+**It is a header in a comment, not a GitHub review event.** The action never submits an approval or a
+formal "changes requested" review, and that is deliberate:
+
+- A bot approval can satisfy a branch protection rule that requires an approving review, which would
+  let a pull request merge with no human having read it. That is a worse outcome than any review this
+  action could produce is worth.
+- A formal REQUEST CHANGES review is dismissible only by a reviewer with write access, so a false
+  positive from a model becomes a merge blocker that a contributor cannot clear themselves.
+
+**The check run is the opt-in.** `fail_on_request_changes: true` makes a REQUEST CHANGES verdict fail
+the action, and a failed check *can* be a required check. It is off by default for the same reason:
+a model is not reliable enough to hold a merge veto unless a repository decides it is. When it is
+off, the check goes green no matter what the review found, and the verdict lives in the summary
+comment and the `verdict` output where a workflow can act on it however it likes.
 
 ## Providers
 
@@ -323,8 +342,46 @@ anything, and **neither requires an API key**:
 ```yaml
 # .claude-review.yml — review the pipeline, spend nothing
 provider: fixture
-fixture_path: test/fixtures/findings.json
+fixture_path: examples/findings.json
 ```
+
+## Example output
+
+[`examples/`](examples/) holds the artefacts of real runs, copied byte for byte:
+
+| File | What it is |
+|------|------------|
+| [`prompt.txt`](examples/prompt.txt) | The complete assembled prompt as `provider: dry-run` writes it — system prompt, every diff with its line-number gutter, and the forced tool schema. |
+| [`findings.json`](examples/findings.json) | The review of that prompt, in the shape the tool call returns. |
+| [`inline-comment.md`](examples/inline-comment.md) | The body of a posted comment, marker and committable ` ```suggestion ` block included. |
+| [`inline-comment-resolved.md`](examples/inline-comment-resolved.md) | The same comment after its finding was fixed: rewritten, collapsed, original text preserved under the fold. |
+| [`summary-comment.md`](examples/summary-comment.md) | A summary from a run whose token budget ran out — eight files listed by skip reason. |
+| [`summary-comment-with-cost.md`](examples/summary-comment-with-cost.md) | A summary with the cost readout populated from reported usage. |
+
+They come from two public pull requests in
+[hebihime/claude-review-sandbox](https://github.com/hebihime/claude-review-sandbox), which runs this
+action on live pull requests:
+[PR #1](https://github.com/hebihime/claude-review-sandbox/pull/1) is the skip-reason and budget
+demonstration, [PR #2](https://github.com/hebihime/claude-review-sandbox/pull/2) is the comments and
+cost demonstration. The comments on both are real comments, posted by real runs, and re-running the
+workflow updates them in place.
+
+### Where the review text comes from
+
+**This project has never made a live Anthropic API call, and its author does not hold a key.** The
+findings in those examples were produced by running the action with `provider: dry-run`, handing the
+resulting prompt to Claude Code, and replaying its answer with `provider: fixture`. Everything the
+action does with a review — position mapping, filtering, the comment cap, posting, idempotent
+updates, the verdict, the cost arithmetic — runs for real on those pull requests. What has never run
+outside a unit test is the HTTP request in [`src/model.ts`](src/model.ts) that turns a prompt into
+findings.
+
+The project brief asked for "2–3 public example PRs with real reviews" linked here. This is the
+honest version of that: real pull requests, real comments, a real review — with a human-in-the-loop
+model call rather than one billed to CI. The token counts in
+[`summary-comment-with-cost.md`](examples/summary-comment-with-cost.md) are likewise representative
+of a review that size rather than measured, and the summary would say so if the numbers were real.
+[`examples/README.md`](examples/README.md) spells out the whole provenance chain.
 
 ## Skipping a review
 
@@ -332,9 +389,46 @@ Add the `skip-review` label to a pull request. The action logs a notice and exit
 check goes green rather than being skipped, so required-check configuration keeps working. The label
 is honoured before any API call, so a skipped PR costs nothing.
 
+## Dogfooding
+
+[`.github/workflows/self-review.yml`](.github/workflows/self-review.yml) points this action at this
+repository's own pull requests, with `uses: ./` rather than `@v1` — a change that breaks the reviewer
+should be reviewed by the broken code, which is the entire point of dogfooding.
+
+It is gated on the secret existing:
+
+```yaml
+env:
+  HAS_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+```
+
+There is no `ANTHROPIC_API_KEY` on this repository, so every run stops at a notice and costs nothing.
+Fork it, add the secret, and the self-review works with no edit. Two details are load-bearing and are
+asserted by [`test/self-review.test.ts`](test/self-review.test.ts): the gate cannot be written as a
+job-level `if:`, because a job condition can only read the `github`, `needs`, `vars` and `inputs`
+contexts and `secrets.*` there is a workflow load error; and the trigger is `pull_request`, never
+`pull_request_target`, which would hand the key to code from an untrusted fork branch. Fork pull
+requests therefore get no self-review, which is the correct side to err on.
+
+The same workflow, with `uses: hebihime/claude-review-action@v1` and the secret in place, is what
+installs the action on any other repository — that is the whole of the setup. Without a key, what a
+sibling repository can adopt today is the `dry-run` or `fixture` configuration in
+[Providers](#providers), which exercises everything except the model call.
+
+## Versioning
+
+| Ref | What it is |
+|-----|------------|
+| `@v1.0.0` | An immutable tag. Pin here if you want the bytes to stay the same. |
+| `@v1` | A moving pointer to the newest `v1.x.y`. Bug fixes and additive changes arrive automatically; nothing that changes existing behaviour will. |
+| `@<sha>` | A commit. The strongest pin, and what a security-conscious repository should use. |
+
+`v1` will not be moved across a behaviour change — a new default, a changed comment body, a removed
+config key. Those get `v2`.
+
 ## Verified against real infrastructure
 
-Every milestone is exercised on GitHub-hosted runners from
+Every feature here was exercised on GitHub-hosted runners from
 [hebihime/claude-review-sandbox](https://github.com/hebihime/claude-review-sandbox), which runs the
 tagged action on live pull requests. Handling:
 
@@ -376,6 +470,11 @@ Local `npm test` cannot catch metadata errors, because nothing parses `action.ym
 code ran; `test/action-yml.test.ts` now asserts that `action.yml` uses only contexts available at
 metadata-parse time.
 
+**What is not on this list is a live model call.** The `anthropic` provider's request path — building
+the Messages request, forcing the tool, reading `usage` back off the response — is covered by unit
+tests against a mocked client, and has never run against the real API. Everything downstream of it
+has, via `fixture`.
+
 ## Local development
 
 ```bash
@@ -388,6 +487,26 @@ npm run all         # all three, in order
 
 `dist/` is committed on purpose: GitHub runs `dist/index.js` directly and never installs
 dependencies. CI fails a PR that changes `src/` without rebuilding.
+
+### The test suite
+
+294 tests across 20 files, no network and no credentials. The ones worth knowing about:
+
+| File | What it pins down |
+|------|-------------------|
+| `config.test.ts` | Every validation message, and that the shipped `.claude-review.yml` parses to exactly the built-in defaults. |
+| `patch.test.ts`, `findings.test.ts` | Diff→position mapping. The rendered line-number gutter is asserted to equal the set of commentable lines exactly, because the prompt and the mapper have to agree or every finding lands one line off. |
+| `comments.test.ts` | Marker matching, and each row of the idempotency table above against a recording Octokit stub. |
+| `budget.test.ts`, `plan.test.ts` | Churn ordering, the tie-break by path, and each skip reason. |
+| `pricing.test.ts` | That an unknown model produces no number rather than a plausible one. |
+| `self-review.test.ts` | That the dogfooding workflow cannot start calling the API by accident. |
+| `bundle.test.ts` | **Executes the committed `dist/index.js`** against a local GitHub API stub. |
+
+That last one exists because this project has now shipped two bugs that were invisible in the source
+and only appeared in the bundle: the `action.yml` metadata failure above, and zod's locale being
+tree-shaken out by `ncc`, which degraded every validation message to a bare `Invalid input` while all
+unit tests kept passing. Anything whose correctness could depend on bundling belongs in
+`bundle.test.ts`, not in a unit test.
 
 ## Security
 
