@@ -1,0 +1,34 @@
+name: 'Claude Review'
+description: 'Configurable AI code review on pull requests: inline comments, a summary verdict, idempotent re-runs, and explicit cost controls.'
+author: 'hebihime'
+
+branding:
+  icon: 'check-circle'
+  color: 'purple'
+
+inputs:
+  anthropic_api_key:
+    description: 'Anthropic API key. Store it as a repository secret and pass it as ${{ secrets.ANTHROPIC_API_KEY }}. Never hard-code it in the workflow.'
+    required: true
+  config_path:
+    description: 'Path (relative to the repository root) of the review config file.'
+    required: false
+    default: '.claude-review.yml'
+  github_token:
+    description: 'Token used for all GitHub API calls. Needs pull-requests:write to post review comments.'
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  verdict:
+    description: 'One of approve, comment, or request_changes.'
+  findings_count:
+    description: 'Number of findings that survived filtering and were posted.'
+  cost_usd:
+    description: 'Estimated USD cost of the model calls made during this run.'
+  skipped:
+    description: 'true when the run exited early (not a pull request, or the skip-review label was present).'
+
+runs:
+  using: 'node24'
+  main: 'dist/index.js'
