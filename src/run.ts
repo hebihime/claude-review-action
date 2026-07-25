@@ -17,6 +17,7 @@ import {
   type SelectionResult
 } from './findings.js'
 import { decideVerdict, type Verdict } from './verdict.js'
+import { listReviewComments, planComments, syncComments, type SyncResult } from './comments.js'
 
 /** Group the skipped files by reason so the log stays short on a big PR. */
 function logSkipped(skipped: readonly SkippedFile[]): void {
@@ -118,6 +119,34 @@ function logFindings(selection: SelectionResult, findings: readonly MappedFindin
   }
 }
 
+/**
+ * One line for the common case, detail only when something happened.
+ *
+ * A steady-state re-run should read `0 created, 0 updated, 3 unchanged` — that is
+ * the whole promise of the idempotency marker, and it should be visible at a
+ * glance in the log without opening a group.
+ */
+function logComments(result: SyncResult): void {
+  core.info(
+    `Comments:      ${result.created} created, ${result.updated} updated, ${result.unchanged} unchanged, ${result.resolved} resolved, ${result.revived} revived.`
+  )
+
+  if (result.collapseNote) {
+    core.info(
+      `Resolved comments were marked in place but could not be collapsed: ${result.collapseNote}. The review itself is unaffected.`
+    )
+  }
+
+  if (result.failures.length > 0) {
+    core.warning(
+      `${result.failures.length} comment(s) were rejected by GitHub and could not be posted. The rest of the review was posted normally.`
+    )
+    core.startGroup(`Rejected comments (${result.failures.length})`)
+    for (const failure of result.failures) core.info(`${failure.path}:${failure.line ?? '?'} — ${failure.detail}`)
+    core.endGroup()
+  }
+}
+
 function logUsage(outcome: ReviewOutcome, config: ReviewConfig): void {
   if (outcome.note) core.info(outcome.note)
 
@@ -137,11 +166,13 @@ function logUsage(outcome: ReviewOutcome, config: ReviewConfig): void {
 }
 
 /**
- * Milestone 3: everything up to posting.
+ * Milestone 4: everything up to the summary comment.
  *
  * Resolves the PR, loads and validates the config, fetches the diff, decides
- * what fits the token budget, asks the model for findings, and maps each one
- * onto a line a comment can actually anchor to. Posting lands in milestone 4.
+ * what fits the token budget, asks the model for findings, maps each one onto a
+ * line a comment can actually anchor to, and reconciles those findings against
+ * the comments already on the pull request. The summary comment, the verdict
+ * header and the USD cost readout land in milestone 5.
  */
 export async function run(): Promise<void> {
   const inputs = readInputs()
@@ -207,7 +238,17 @@ export async function run(): Promise<void> {
   logFindings(selection, findings)
 
   core.info('')
-  core.info('Findings are mapped to commentable lines. Posting them lands in milestone 4 of 6.')
+  // `dry-run` stopped before the model, so its empty findings list is "we did not
+  // look", not "we looked and found nothing". Reconciling against it would resolve
+  // every comment on the pull request and then recreate them on the next real run.
+  if (outcome.provider === 'dry-run') {
+    core.info('Comments:      none — provider "dry-run" produced no findings to reconcile against.')
+  } else {
+    const existing = await listReviewComments(octokit, pr)
+    const reviewedPaths = new Set(plan.files.map(planned => planned.file.path))
+    const commentPlan = planComments(selection.selected, existing, reviewedPaths)
+    logComments(await syncComments(octokit, pr, commentPlan))
+  }
 
   finish(selection, config)
 }

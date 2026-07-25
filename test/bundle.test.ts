@@ -51,33 +51,108 @@ const FIXTURE_PATCH = [
  *
  * `@actions/github` builds its Octokit against `GITHUB_API_URL`, so pointing that
  * at this server lets the real bundle run its whole pipeline — config, diff,
- * budget, prompt assembly, position mapping — with no network and no credentials.
+ * budget, prompt assembly, position mapping, comment posting — with no network
+ * and no credentials.
+ *
+ * It is deliberately *stateful*: created comments are stored and returned by the
+ * next list call, so running the bundle twice against it is a real test of
+ * idempotency rather than a test of a canned response.
  */
 let server: Server
 let apiUrl: string
 
+interface StoredComment {
+  id: number
+  node_id: string
+  path: string
+  line: number | null
+  body: string
+}
+
+let comments: StoredComment[] = []
+let graphqlCalls: string[] = []
+let nextCommentId = 1
+
+function resetApiState(): void {
+  comments = []
+  graphqlCalls = []
+  nextCommentId = 1
+}
+
+async function readBody(req: { on: (event: string, fn: (chunk?: Buffer) => void) => void }): Promise<string> {
+  const chunks: Buffer[] = []
+  await new Promise<void>(resolve => {
+    req.on('data', chunk => chunk && chunks.push(chunk))
+    req.on('end', () => resolve())
+  })
+  return Buffer.concat(chunks).toString('utf8')
+}
+
 beforeAll(async () => {
   server = createServer((req, res) => {
     const url = req.url ?? ''
+    const method = req.method ?? 'GET'
     res.setHeader('content-type', 'application/json')
 
-    if (url.startsWith('/repos/octo/demo/pulls/1/files')) {
-      res.end(
-        JSON.stringify([
-          { filename: 'src/total.js', status: 'modified', additions: 3, deletions: 1, patch: FIXTURE_PATCH },
-          { filename: 'package-lock.json', status: 'modified', additions: 900, deletions: 4, patch: '@@ -1 +1 @@\n+x' },
-          { filename: 'assets/logo.png', status: 'added', additions: 0, deletions: 0 }
-        ])
-      )
-      return
-    }
-    if (url.startsWith('/repos/octo/demo/pulls/1')) {
-      res.end(JSON.stringify({ number: 1, changed_files: 3, additions: 903, deletions: 5 }))
-      return
-    }
+    void (async () => {
+      if (url === '/graphql') {
+        graphqlCalls.push(await readBody(req))
+        res.end(JSON.stringify({ data: {} }))
+        return
+      }
 
-    res.statusCode = 404
-    res.end(JSON.stringify({ message: 'Not Found' }))
+      if (url.startsWith('/repos/octo/demo/pulls/1/files')) {
+        res.end(
+          JSON.stringify([
+            { filename: 'src/total.js', status: 'modified', additions: 3, deletions: 1, patch: FIXTURE_PATCH },
+            { filename: 'package-lock.json', status: 'modified', additions: 900, deletions: 4, patch: '@@ -1 +1 @@\n+x' },
+            { filename: 'assets/logo.png', status: 'added', additions: 0, deletions: 0 }
+          ])
+        )
+        return
+      }
+
+      if (url.startsWith('/repos/octo/demo/pulls/1/comments')) {
+        if (method === 'POST') {
+          const posted = JSON.parse(await readBody(req)) as { path: string; line: number; body: string }
+          const created: StoredComment = {
+            id: nextCommentId++,
+            node_id: `NODE_${nextCommentId}`,
+            path: posted.path,
+            line: posted.line,
+            body: posted.body
+          }
+          comments.push(created)
+          res.statusCode = 201
+          res.end(JSON.stringify(created))
+          return
+        }
+        res.end(JSON.stringify(comments))
+        return
+      }
+
+      // updateReviewComment: PATCH /repos/{o}/{r}/pulls/comments/{id}
+      const update = /^\/repos\/octo\/demo\/pulls\/comments\/(\d+)/.exec(url)
+      if (update) {
+        const target = comments.find(comment => comment.id === Number(update[1]))
+        if (!target) {
+          res.statusCode = 404
+          res.end(JSON.stringify({ message: 'No comment' }))
+          return
+        }
+        target.body = (JSON.parse(await readBody(req)) as { body: string }).body
+        res.end(JSON.stringify(target))
+        return
+      }
+
+      if (url.startsWith('/repos/octo/demo/pulls/1')) {
+        res.end(JSON.stringify({ number: 1, changed_files: 3, additions: 903, deletions: 5 }))
+        return
+      }
+
+      res.statusCode = 404
+      res.end(JSON.stringify({ message: 'Not Found' }))
+    })()
   })
 
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
@@ -145,6 +220,7 @@ afterEach(() => {
     const dir = dirs.pop()
     if (dir) rmSync(dir, { recursive: true, force: true })
   }
+  resetApiState()
 })
 
 describe('the committed bundle', () => {
@@ -269,5 +345,87 @@ describe('the committed bundle, running the full pipeline', () => {
 
     expect(result.status).toBe(1)
     expect(result.output).toContain('required when provider is "anthropic"')
+  })
+})
+
+const FIXTURE_CONFIG = 'provider: fixture\nfixture_path: findings.json\n'
+
+const ONE_FINDING = JSON.stringify([
+  {
+    path: 'src/total.js',
+    line: 3,
+    severity: 'error',
+    rule_id: 'correctness',
+    message: 'This loop reads one past the end of the array.',
+    suggestion: '  for (let i = 0; i < items.length; i++) sum += items[i]'
+  }
+])
+
+describe('the committed bundle, posting inline comments', () => {
+  it('posts a finding as a review comment carrying the idempotency marker', async () => {
+    const result = await runBundle(FIXTURE_CONFIG, { withApi: true, files: { 'findings.json': ONE_FINDING } })
+
+    expect(result.status).toBe(0)
+    expect(result.output).toContain('1 created, 0 updated, 0 unchanged, 0 resolved, 0 revived')
+    expect(comments).toHaveLength(1)
+    expect(comments[0]).toMatchObject({ path: 'src/total.js', line: 3 })
+    expect(comments[0]?.body).toMatch(/<!-- claude-review:v1:[0-9a-f]{40} -->/)
+    expect(comments[0]?.body).toContain('**Error** · `correctness`')
+    expect(comments[0]?.body).toContain('```suggestion')
+  })
+
+  it('changes nothing at all on a re-run against the same commit', async () => {
+    // The point of the whole milestone. Two identical runs against a stateful API
+    // must leave exactly one comment, untouched — no duplicate, no needless edit.
+    await runBundle(FIXTURE_CONFIG, { withApi: true, files: { 'findings.json': ONE_FINDING } })
+    const before = comments[0]?.body
+    const second = await runBundle(FIXTURE_CONFIG, { withApi: true, files: { 'findings.json': ONE_FINDING } })
+
+    expect(second.output).toContain('0 created, 0 updated, 1 unchanged, 0 resolved, 0 revived')
+    expect(comments).toHaveLength(1)
+    expect(comments[0]?.body).toBe(before)
+  })
+
+  it('edits the existing comment in place when the finding text changes', async () => {
+    await runBundle(FIXTURE_CONFIG, { withApi: true, files: { 'findings.json': ONE_FINDING } })
+    const rewritten = ONE_FINDING.replace('reads one past the end of the array', 'is off by one')
+    const second = await runBundle(FIXTURE_CONFIG, { withApi: true, files: { 'findings.json': rewritten } })
+
+    expect(second.output).toContain('0 created, 1 updated, 0 unchanged')
+    expect(comments).toHaveLength(1)
+    expect(comments[0]?.body).toContain('is off by one')
+  })
+
+  it('marks a comment resolved, and collapses it, once the finding is gone', async () => {
+    await runBundle(FIXTURE_CONFIG, { withApi: true, files: { 'findings.json': ONE_FINDING } })
+    const second = await runBundle(FIXTURE_CONFIG, { withApi: true, files: { 'findings.json': '[]' } })
+
+    expect(second.output).toContain('0 created, 0 updated, 0 unchanged, 1 resolved, 0 revived')
+    expect(comments).toHaveLength(1)
+    expect(comments[0]?.body).toContain('no longer reported')
+    // The original text survives resolution — a thread may have replies on it.
+    expect(comments[0]?.body).toContain('reads one past the end')
+    expect(graphqlCalls.join('')).toContain('minimizeComment')
+  })
+
+  it('revives the same comment rather than posting a second one when the finding returns', async () => {
+    await runBundle(FIXTURE_CONFIG, { withApi: true, files: { 'findings.json': ONE_FINDING } })
+    await runBundle(FIXTURE_CONFIG, { withApi: true, files: { 'findings.json': '[]' } })
+    const third = await runBundle(FIXTURE_CONFIG, { withApi: true, files: { 'findings.json': ONE_FINDING } })
+
+    expect(third.output).toContain('0 created, 0 updated, 0 unchanged, 0 resolved, 1 revived')
+    expect(comments).toHaveLength(1)
+    expect(comments[0]?.body).not.toContain('no longer reported')
+    expect(graphqlCalls.join('')).toContain('unminimizeComment')
+  })
+
+  it('touches no comment at all in dry-run mode', async () => {
+    // dry-run never asked the model anything, so its empty findings list must not
+    // be read as "everything was fixed" and resolve the whole pull request.
+    await runBundle(FIXTURE_CONFIG, { withApi: true, files: { 'findings.json': ONE_FINDING } })
+    const second = await runBundle('provider: dry-run\ndry_run_path: prompt.txt\n', { withApi: true })
+
+    expect(second.output).toContain('none — provider "dry-run" produced no findings')
+    expect(comments[0]?.body).not.toContain('no longer reported')
   })
 })

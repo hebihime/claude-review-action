@@ -29568,7 +29568,7 @@ module.exports = {
 
 __nccwpck_require__.a(module, async (__webpack_handle_async_dependencies__, __webpack_async_result__) => { try {
 /* harmony import */ var _actions_core__WEBPACK_IMPORTED_MODULE_0__ = __nccwpck_require__(6257);
-/* harmony import */ var _run_js__WEBPACK_IMPORTED_MODULE_1__ = __nccwpck_require__(5434);
+/* harmony import */ var _run_js__WEBPACK_IMPORTED_MODULE_1__ = __nccwpck_require__(4212);
 /* harmony import */ var _redact_js__WEBPACK_IMPORTED_MODULE_2__ = __nccwpck_require__(6670);
 
 
@@ -29647,7 +29647,7 @@ function resetSecretsForTesting() {
 
 /***/ }),
 
-/***/ 5434:
+/***/ 4212:
 /***/ ((__unused_webpack_module, __webpack_exports__, __nccwpck_require__) => {
 
 
@@ -45935,7 +45935,319 @@ function decideVerdict(selection, config) {
     return triggered ? 'request_changes' : 'comment';
 }
 
+;// CONCATENATED MODULE: ./src/comments.ts
+
+/**
+ * Posting findings as inline review comments, idempotently.
+ *
+ * The hard part is not creating comments, it is the second run. A pull request is
+ * re-reviewed on every push, and a reviewer that re-posts the same three comments
+ * each time is worse than no reviewer at all. So every comment carries a hidden
+ * marker holding the sha1 of `path:line:rule_id`, and a re-run reconciles against
+ * it: same marker and same text is left alone, same marker and different text is
+ * edited in place, a marker with no matching finding is marked resolved, and only
+ * a genuinely new finding creates a comment.
+ *
+ * The marker is the identity — not the comment author. The action may post as
+ * `github-actions[bot]` in one repo and as a PAT's user in another, and a repo can
+ * switch between them without orphaning every comment it has already made.
+ */
+const MARKER_VERSION = 'v1';
+/** `<!-- claude-review:v1:<sha1> -->`, exactly as the spec specifies it. */
+function markerFor(fingerprint) {
+    return `<!-- claude-review:${MARKER_VERSION}:${fingerprint} -->`;
+}
+const MARKER_PATTERN = new RegExp(`<!--\\s*claude-review:${MARKER_VERSION}:([0-9a-f]{40})\\s*-->`);
+/** Distinct from the fingerprint marker so neither pattern can match the other. */
+const RESOLVED_MARKER = '<!-- claude-review:resolved -->';
+function extractFingerprint(body) {
+    return MARKER_PATTERN.exec(body)?.[1] ?? null;
+}
+function isResolved(body) {
+    return body.includes(RESOLVED_MARKER);
+}
+function stripMarkers(body) {
+    return body.replace(MARKER_PATTERN, '').split(RESOLVED_MARKER).join('').trim();
+}
+const SEVERITY_LABEL = {
+    error: 'Error',
+    warn: 'Warning',
+    nit: 'Nit'
+};
+/**
+ * A fence long enough to contain `text`.
+ *
+ * A suggestion is model output that frequently *is* markdown-adjacent code, and a
+ * three-backtick run inside it would close the block early and spill raw markdown
+ * into the comment.
+ */
+function fenceFor(text) {
+    let longest = 0;
+    for (const run of text.match(/`+/g) ?? [])
+        longest = Math.max(longest, run.length);
+    return '`'.repeat(Math.max(3, longest + 1));
+}
+/**
+ * The comment body, and the single definition of "has this finding changed".
+ *
+ * `planComments` compares a freshly rendered body against the one already on
+ * GitHub, so anything that varies between runs without the finding changing —
+ * a timestamp, a run number, a commit sha — must never appear here. It would make
+ * every re-run rewrite every comment.
+ */
+function renderCommentBody(finding) {
+    const parts = [markerFor(finding.fingerprint), `**${SEVERITY_LABEL[finding.severity]}** · \`${finding.ruleId}\``, '', finding.message];
+    if (finding.suggestion) {
+        const fence = fenceFor(finding.suggestion);
+        // A ```suggestion block renders as a one-click committable change. It replaces
+        // the line this comment is anchored to, which is exactly the contract the
+        // prompt gives the model for the `suggestion` field.
+        parts.push('', `${fence}suggestion`, finding.suggestion, fence);
+    }
+    return parts.join('\n');
+}
+const RESOLVE_NOTE = {
+    gone: '**Resolved** — this finding is no longer reported for the latest commit.',
+    superseded: '**Outdated** — this comment could not be re-anchored to the current diff; a newer comment carries the finding.'
+};
+/**
+ * Rewrite a comment into its resolved form, keeping the fingerprint marker.
+ *
+ * The original text is folded into a `<details>` rather than deleted: the comment
+ * may already have replies, and destroying the thread to tidy up would lose
+ * conversation the author cared about. Keeping the marker is what makes a revive
+ * possible if the finding comes back on a later push.
+ */
+function renderResolvedBody(existingBody, reason) {
+    const fingerprint = extractFingerprint(existingBody);
+    const original = stripMarkers(existingBody);
+    const lines = fingerprint ? [markerFor(fingerprint)] : [];
+    lines.push(RESOLVED_MARKER, RESOLVE_NOTE[reason], '', '<details><summary>Original comment</summary>', '', original, '', '</details>');
+    return lines.join('\n');
+}
+/**
+ * Every review comment on the PR that carries one of our markers, oldest first.
+ *
+ * Ordered by id so that when two comments somehow share a fingerprint — a partly
+ * failed earlier run — the same one wins every time and the extras are collapsed.
+ */
+async function listReviewComments(octokit, pr) {
+    const raw = await callGitHub(`list review comments on pull request #${pr.number}`, () => octokit.paginate(octokit.rest.pulls.listReviewComments, {
+        owner: pr.owner,
+        repo: pr.repo,
+        pull_number: pr.number,
+        per_page: 100
+    }));
+    const ours = [];
+    for (const comment of raw) {
+        const body = comment.body ?? '';
+        const fingerprint = extractFingerprint(body);
+        if (!fingerprint)
+            continue;
+        ours.push({
+            id: comment.id,
+            nodeId: comment.node_id,
+            path: comment.path,
+            line: comment.line ?? null,
+            body,
+            fingerprint
+        });
+    }
+    return ours.sort((a, b) => a.id - b.id);
+}
+function normalizeBody(body) {
+    return body.replace(/\r\n/g, '\n').trim();
+}
+/**
+ * Decide what to do with each finding and each comment already on the PR.
+ *
+ * `reviewedPaths` is the guard against flapping. A file dropped by the token
+ * budget, or newly matched by an ignore glob, produces no findings this run — but
+ * that is not evidence its findings were fixed, and resolving its comments would
+ * un-resolve them on the next run that has budget to spare. Only a file that was
+ * actually sent to the model can have its comments resolved.
+ */
+function planComments(selected, existing, reviewedPaths) {
+    const byFingerprint = new Map();
+    for (const comment of existing) {
+        const bucket = byFingerprint.get(comment.fingerprint);
+        if (bucket)
+            bucket.push(comment);
+        else
+            byFingerprint.set(comment.fingerprint, [comment]);
+    }
+    // Oldest first, decided here rather than trusted from the caller: when a partly
+    // failed run has left two comments on one fingerprint, which of them survives
+    // must not depend on the order the API happened to return them in.
+    for (const bucket of byFingerprint.values())
+        bucket.sort((a, b) => a.id - b.id);
+    const posts = [];
+    const resolves = [];
+    const claimed = new Set();
+    for (const finding of selected) {
+        claimed.add(finding.fingerprint);
+        const group = byFingerprint.get(finding.fingerprint) ?? [];
+        // Only a comment GitHub can still place on the diff is worth editing. An
+        // outdated one is collapsed under the old commit where nobody will read it,
+        // so the finding is re-posted at its current line and the stale copy is
+        // marked outdated rather than left to look like live feedback.
+        const target = group.find(comment => comment.line !== null);
+        for (const comment of group) {
+            if (comment === target)
+                continue;
+            if (isResolved(comment.body))
+                continue;
+            resolves.push({ existing: comment, reason: 'superseded' });
+        }
+        if (!target) {
+            posts.push({ action: 'create', finding });
+            continue;
+        }
+        if (isResolved(target.body)) {
+            posts.push({ action: 'revive', finding, existing: target });
+            continue;
+        }
+        posts.push({
+            action: normalizeBody(target.body) === normalizeBody(renderCommentBody(finding)) ? 'unchanged' : 'update',
+            finding,
+            existing: target
+        });
+    }
+    for (const [fingerprint, group] of byFingerprint) {
+        if (claimed.has(fingerprint))
+            continue;
+        for (const comment of group) {
+            if (!reviewedPaths.has(comment.path))
+                continue;
+            if (isResolved(comment.body))
+                continue;
+            resolves.push({ existing: comment, reason: 'gone' });
+        }
+    }
+    resolves.sort((a, b) => a.existing.id - b.existing.id);
+    return { posts, resolves };
+}
+/**
+ * `minimizeComment` classifiers. RESOLVED and OUTDATED are the two that describe
+ * what actually happened, and GitHub renders both as a collapsed comment.
+ */
+const CLASSIFIER = { gone: 'RESOLVED', superseded: 'OUTDATED' };
+const MINIMIZE_MUTATION = `mutation($id: ID!, $classifier: ReportedContentClassifiers!) {
+  minimizeComment(input: { subjectId: $id, classifier: $classifier }) { clientMutationId }
+}`;
+const UNMINIMIZE_MUTATION = `mutation($id: ID!) {
+  unminimizeComment(input: { subjectId: $id }) { clientMutationId }
+}`;
+/**
+ * Collapse or expand a comment. Best effort, by design.
+ *
+ * This is the only GraphQL call in the action, and the rewritten body already says
+ * the comment is resolved. If the mutation is unavailable — an older GitHub
+ * Enterprise, a token without the scope — the review is still correct, just
+ * slightly noisier, and failing the run over presentation would be absurd.
+ */
+async function setCollapsed(octokit, comment, reason) {
+    try {
+        if (reason) {
+            await octokit.graphql(MINIMIZE_MUTATION, { id: comment.nodeId, classifier: CLASSIFIER[reason] });
+        }
+        else {
+            await octokit.graphql(UNMINIMIZE_MUTATION, { id: comment.nodeId });
+        }
+        return null;
+    }
+    catch (error) {
+        return error?.message ?? String(error);
+    }
+}
+/** True for the failures that are about one comment rather than about the run. */
+function isSingleCommentRejection(error) {
+    return error instanceof GitHubApiError && error.status === 422;
+}
+/**
+ * Execute the plan.
+ *
+ * A 422 is tolerated per comment and nothing else is. GitHub returns 422 when a
+ * single comment cannot be anchored — the one failure mode that is about that
+ * comment alone, and that should not cost the author the other nine. A 401, 403 or
+ * 5xx will fail identically for every comment, so it is raised immediately instead
+ * of being repeated `max_comments` times in the log.
+ */
+async function syncComments(octokit, pr, plan) {
+    const result = { created: 0, updated: 0, unchanged: 0, resolved: 0, revived: 0, failures: [] };
+    let collapseNote = null;
+    for (const post of plan.posts) {
+        const { finding } = post;
+        if (post.action === 'unchanged') {
+            result.unchanged += 1;
+            continue;
+        }
+        const body = renderCommentBody(finding);
+        const existing = post.existing;
+        try {
+            if (existing) {
+                await callGitHub(`update review comment on ${finding.path}:${finding.line}`, () => octokit.rest.pulls.updateReviewComment({
+                    owner: pr.owner,
+                    repo: pr.repo,
+                    comment_id: existing.id,
+                    body
+                }));
+                if (post.action === 'revive') {
+                    result.revived += 1;
+                    collapseNote ??= await setCollapsed(octokit, existing, null);
+                }
+                else {
+                    result.updated += 1;
+                }
+            }
+            else {
+                await callGitHub(`comment on ${finding.path}:${finding.line}`, () => octokit.rest.pulls.createReviewComment({
+                    owner: pr.owner,
+                    repo: pr.repo,
+                    pull_number: pr.number,
+                    commit_id: pr.headSha,
+                    path: finding.path,
+                    line: finding.line,
+                    side: finding.side,
+                    body
+                }));
+                result.created += 1;
+            }
+        }
+        catch (error) {
+            if (!isSingleCommentRejection(error))
+                throw error;
+            result.failures.push({
+                path: finding.path,
+                line: finding.line,
+                detail: error.message
+            });
+        }
+    }
+    for (const { existing, reason } of plan.resolves) {
+        try {
+            await callGitHub(`mark the comment on ${existing.path} as resolved`, () => octokit.rest.pulls.updateReviewComment({
+                owner: pr.owner,
+                repo: pr.repo,
+                comment_id: existing.id,
+                body: renderResolvedBody(existing.body, reason)
+            }));
+            result.resolved += 1;
+            collapseNote ??= await setCollapsed(octokit, existing, reason);
+        }
+        catch (error) {
+            if (!isSingleCommentRejection(error))
+                throw error;
+            result.failures.push({ path: existing.path, line: existing.line, detail: error.message });
+        }
+    }
+    if (collapseNote)
+        result.collapseNote = collapseNote;
+    return result;
+}
+
 ;// CONCATENATED MODULE: ./src/run.ts
+
 
 
 
@@ -46027,6 +46339,26 @@ function logFindings(selection, findings) {
         lib_core/* info */.pq(`${disagreements} finding(s) were re-labelled to their rule's configured severity (the model proposed a different one).`);
     }
 }
+/**
+ * One line for the common case, detail only when something happened.
+ *
+ * A steady-state re-run should read `0 created, 0 updated, 3 unchanged` — that is
+ * the whole promise of the idempotency marker, and it should be visible at a
+ * glance in the log without opening a group.
+ */
+function logComments(result) {
+    lib_core/* info */.pq(`Comments:      ${result.created} created, ${result.updated} updated, ${result.unchanged} unchanged, ${result.resolved} resolved, ${result.revived} revived.`);
+    if (result.collapseNote) {
+        lib_core/* info */.pq(`Resolved comments were marked in place but could not be collapsed: ${result.collapseNote}. The review itself is unaffected.`);
+    }
+    if (result.failures.length > 0) {
+        lib_core/* warning */.$e(`${result.failures.length} comment(s) were rejected by GitHub and could not be posted. The rest of the review was posted normally.`);
+        lib_core/* startGroup */.Oh(`Rejected comments (${result.failures.length})`);
+        for (const failure of result.failures)
+            lib_core/* info */.pq(`${failure.path}:${failure.line ?? '?'} — ${failure.detail}`);
+        lib_core/* endGroup */.N4();
+    }
+}
 function logUsage(outcome, config) {
     if (outcome.note)
         lib_core/* info */.pq(outcome.note);
@@ -46040,11 +46372,13 @@ function logUsage(outcome, config) {
     lib_core/* info */.pq(`Model usage:   ${outcome.usage.inputTokens.toLocaleString('en-US')} input / ${outcome.usage.outputTokens.toLocaleString('en-US')} output tokens on ${config.model}.`);
 }
 /**
- * Milestone 3: everything up to posting.
+ * Milestone 4: everything up to the summary comment.
  *
  * Resolves the PR, loads and validates the config, fetches the diff, decides
- * what fits the token budget, asks the model for findings, and maps each one
- * onto a line a comment can actually anchor to. Posting lands in milestone 4.
+ * what fits the token budget, asks the model for findings, maps each one onto a
+ * line a comment can actually anchor to, and reconciles those findings against
+ * the comments already on the pull request. The summary comment, the verdict
+ * header and the USD cost readout land in milestone 5.
  */
 async function run() {
     const inputs = readInputs();
@@ -46090,7 +46424,18 @@ async function run() {
     const selection = selectFindings(findings, config);
     logFindings(selection, findings);
     lib_core/* info */.pq('');
-    lib_core/* info */.pq('Findings are mapped to commentable lines. Posting them lands in milestone 4 of 6.');
+    // `dry-run` stopped before the model, so its empty findings list is "we did not
+    // look", not "we looked and found nothing". Reconciling against it would resolve
+    // every comment on the pull request and then recreate them on the next real run.
+    if (outcome.provider === 'dry-run') {
+        lib_core/* info */.pq('Comments:      none — provider "dry-run" produced no findings to reconcile against.');
+    }
+    else {
+        const existing = await listReviewComments(octokit, pr);
+        const reviewedPaths = new Set(plan.files.map(planned => planned.file.path));
+        const commentPlan = planComments(selection.selected, existing, reviewedPaths);
+        logComments(await syncComments(octokit, pr, commentPlan));
+    }
     finish(selection, config);
 }
 function emptySelection() {

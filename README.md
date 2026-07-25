@@ -5,12 +5,11 @@
 
 Opinionated, configurable AI code review on every pull request — with idempotent comments and a cost readout.
 
-> **Status: milestone 3 of 6.** The action runs the full review pipeline: it loads and validates
+> **Status: milestone 4 of 6.** The action runs the review end to end: it loads and validates
 > `.claude-review.yml`, fetches the diff, decides what fits the token budget, asks the model for
-> findings through a forced tool call, and maps each finding onto a line a comment can actually
-> anchor to — dropping and counting the ones that do not map. It reports a verdict and a findings
-> count as outputs. It does **not** post comments yet; that is milestone 4, and the cost readout
-> lands with the summary comment in milestone 5.
+> findings through a forced tool call, maps each finding onto a line a comment can actually anchor
+> to, and posts them as inline review comments that update in place on every re-run. Still to come:
+> the summary comment, the verdict header and the USD cost readout, all in milestone 5.
 
 ## Build order
 
@@ -19,8 +18,8 @@ Opinionated, configurable AI code review on every pull request — with idempote
 | 1 | Scaffold, `action.yml`, ncc build, hello-world run | ✅ done |
 | 2 | Config loading + validation, diff fetching, ignore/budget logic | ✅ done |
 | 3 | Model review call, structured findings, diff→position mapping | ✅ done |
-| 4 | Inline comments + idempotent update logic | ⬜ next |
-| 5 | Summary comment, verdict, cost readout | ⬜ |
+| 4 | Inline comments + idempotent update logic | ✅ done |
+| 5 | Summary comment, verdict, cost readout | ⬜ next |
 | 6 | Tests green, full README, tag `v1` | ⬜ |
 
 ## Inputs
@@ -40,7 +39,7 @@ Opinionated, configurable AI code review on every pull request — with idempote
 | `cost_usd` | Estimated USD cost of the model calls in this run. |
 | `skipped` | `true` when the run exited early (not a PR, or `skip-review` label present). |
 
-## Quickstart (current behaviour)
+## Quickstart
 
 ```yaml
 name: Claude Review
@@ -62,8 +61,13 @@ jobs:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
 ```
 
-`pull-requests: write` is not needed yet (nothing is posted) but is included so the permission block
-does not have to change when milestone 4 lands.
+`pull-requests: write` is required — without it the action can read the diff but every comment fails
+with a 403. `contents: read` is what `actions/checkout` needs.
+
+**Pull requests from forks** get a read-only `GITHUB_TOKEN` regardless of this block, so the action
+can review them but cannot comment. That is a GitHub security boundary, not something this action can
+work around: use `pull_request_target` (and understand what you are accepting) or accept that fork PRs
+produce log output only.
 
 ## Configuration
 
@@ -170,6 +174,52 @@ Two deliberate choices worth knowing:
   rewrite a comment that had not actually changed.
 - **Unchanged context lines are commentable.** A finding often needs to point at the line a change
   broke, not at the change itself.
+
+## How idempotency works
+
+A pull request is re-reviewed on every push. A reviewer that re-posts the same three comments each
+time is worse than no reviewer at all, so every comment carries a hidden marker:
+
+```html
+<!-- claude-review:v1:9f2c1a…  -->   ← sha1 of "path:line:rule_id"
+```
+
+The marker is the comment's identity. On every run the action lists the review comments on the PR,
+keeps the ones carrying a marker, and reconciles them against this run's findings:
+
+| Situation | What happens |
+|-----------|--------------|
+| Marker present, body identical | **Nothing.** No API call at all. |
+| Marker present, body differs | Edited in place. Same comment, same thread, same replies. |
+| Marker absent from the PR | Created. |
+| Marker on the PR, no matching finding | Marked resolved and collapsed. |
+| Marker resolved, finding came back | Revived — the same comment is restored, not a second one. |
+| Two comments share a marker | The older one wins; the extras are collapsed as outdated. |
+
+A steady-state re-run therefore logs `0 created, 0 updated, 3 unchanged, 0 resolved, 0 revived` and
+makes exactly one API call.
+
+Details that matter:
+
+- **The marker is the identity, not the author.** The action may post as `github-actions[bot]` in one
+  repo and as a PAT's user in another; a repo can switch between them without orphaning every comment
+  it has already made.
+- **Resolved comments are rewritten, not deleted.** The original text is folded into a `<details>`
+  block and the comment is collapsed via GraphQL. A comment may already have replies, and deleting it
+  to tidy up would destroy conversation the author cared about. If the collapse call is unavailable —
+  older GitHub Enterprise, a restricted token — the run says so and carries on; the rewritten body is
+  what actually carries the meaning.
+- **Only files that were reviewed this run can have their comments resolved.** A file dropped by the
+  token budget produces no findings, but that is not evidence its findings were fixed. Resolving it
+  would un-resolve on the next run with budget to spare, and comments would flap on every push.
+- **`provider: dry-run` never touches comments.** Its empty findings list means "we did not look",
+  not "we looked and found nothing".
+- **The marker includes the line number**, per the spec. A finding that slides to a different line is
+  a different fingerprint: the old comment resolves and a new one is created. That is deliberate —
+  the alternative is a comment whose anchor and whose marker disagree.
+- **A rejected comment does not lose the review.** GitHub answers 422 when one comment cannot be
+  anchored; that comment is reported and the rest are posted normally. Any other status (401, 403,
+  5xx) will fail identically for every comment, so it is raised once rather than `max_comments` times.
 
 ### Providers
 
