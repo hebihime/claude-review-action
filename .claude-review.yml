@@ -1,0 +1,102 @@
+# claude-review-action — example configuration
+#
+# Every key below is optional. Delete this file entirely and the action runs on
+# the same defaults shown here. Copy it into your repository root and edit the
+# rules; they are the part worth tailoring.
+
+# The review rules. Each rule needs a unique `id` (it goes into the hidden marker
+# on every comment, so re-runs can find and update the right one), a
+# `description` written as an instruction to the reviewer, and a `severity`.
+#
+# Severities, least to most serious: nit | warn | error
+rules:
+  - id: correctness
+    severity: error
+    description: >-
+      Logic that does not do what the surrounding code and names claim:
+      off-by-one errors, inverted conditions, unhandled null or undefined,
+      missing await, resources that are never released.
+
+  - id: security
+    severity: error
+    description: >-
+      Untrusted input reaching a sensitive sink (shell, SQL, filesystem path,
+      HTML), credentials in source or logs, and missing authorization checks on
+      a code path that needs one.
+
+  - id: error-handling
+    severity: warn
+    description: >-
+      Failures that are swallowed, logged and then ignored, or re-thrown without
+      enough context to act on. Empty catch blocks and unchecked error returns
+      count.
+
+  - id: test-coverage
+    severity: warn
+    description: >-
+      New branching logic or a bug fix that arrives with no test exercising it.
+      Do not raise this for pure refactors or generated code.
+
+  - id: clarity
+    severity: nit
+    description: >-
+      Names, comments, or control flow that will mislead the next reader. Only
+      raise this when you can name a concrete alternative.
+
+# Extra paths to skip, on top of the built-in ignores (lockfiles, dist/**,
+# node_modules/**, vendor/**, *.min.*, *.map, *.snap, generated files).
+#
+# Patterns are glob syntax, evaluated in order, and the last match wins — so a
+# leading "!" re-includes something an earlier pattern excluded.
+ignore_paths: []
+#   - "docs/**"
+#   - "!docs/architecture.md"
+
+# Set to false to drop the built-in ignores and start from ignore_paths alone.
+# Leaving it true is strongly recommended: it is what stops a 12,000-line
+# lockfile from consuming the whole token budget.
+use_default_ignores: true
+
+# Findings below this severity are dropped without being posted.
+min_severity_to_comment: warn
+
+# Hard cap on inline comments per run. Highest severity survives the cap.
+max_comments: 20
+
+# Pre-flight token ceiling for one run. Files are reviewed highest-churn first;
+# anything that does not fit is listed in the summary as skipped rather than
+# quietly dropped.
+token_budget: 150000
+
+# Any Claude model id. claude-haiku-4-5 is the inexpensive default;
+# claude-sonnet-5 is the upgrade for deeper review on a larger budget.
+model: claude-haiku-4-5
+
+# Where the review call goes.
+#   anthropic — the real Messages API (default). Needs anthropic_api_key.
+#   dry-run   — write the assembled prompt to dry_run_path and stop. No API call.
+#   fixture   — replay a findings JSON from fixture_path through the rest of the
+#               pipeline. No API call.
+#
+# dry-run and fixture exist so comment posting, idempotency, filtering and the
+# cost readout can be exercised end to end at zero cost.
+provider: anthropic
+
+# Optional: absolute base URL for a gateway, Bedrock or Vertex endpoint.
+# base_url: https://gateway.example.com
+
+# Only used by the matching provider.
+# fixture_path: test/fixtures/findings.json
+dry_run_path: claude-review-prompt.txt
+
+verdict:
+  # Post REQUEST CHANGES when a finding of at least this severity survives.
+  request_changes_on: error
+  # Post APPROVE (rather than COMMENT) when nothing at all was found.
+  approve_when_clean: true
+
+# Whether a request_changes verdict fails the check run.
+#
+# Off by default on purpose. A failing check is a merge blocker, and a model is
+# not reliable enough to hold that veto unless a repository deliberately opts in.
+fail_on_request_changes: false
