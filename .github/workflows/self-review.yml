@@ -1,0 +1,51 @@
+name: Self review
+
+# Dogfooding: this repository reviews its own pull requests.
+#
+# `uses: ./` runs the action from the pull request's own checkout, not from the
+# `v1` tag. A change that breaks the reviewer should be reviewed by the broken
+# code — that is the whole value of dogfooding — and `dist/` is committed, so the
+# checkout is directly runnable.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  # This is the gate that keeps the workflow inert on repositories with no key.
+  #
+  # It has to live here rather than on the job. A job-level `if:` can only read
+  # the github, needs, vars and inputs contexts — not secrets, and not env — so
+  # `if: secrets.ANTHROPIC_API_KEY != ''` on the job would be a load-time error.
+  # Workflow-level env *can* read secrets, and every step-level `if:` can read
+  # env, so the condition is evaluated once here and applied per step below.
+  HAS_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+
+jobs:
+  review:
+    name: Claude review
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # There is no ANTHROPIC_API_KEY secret on hebihime/claude-review-action and
+      # there is not going to be one, so here every run stops at this step and
+      # costs nothing. The workflow still ships, because a fork that adds the
+      # secret gets working dogfooding without editing anything.
+      #
+      # A pull request from a fork also lands here: GitHub withholds secrets from
+      # fork workflows, so HAS_KEY is false and no key is ever exposed to code
+      # from an untrusted branch.
+      - name: No API key configured
+        if: env.HAS_KEY != 'true'
+        run: |
+          echo "::notice::ANTHROPIC_API_KEY is not set on this repository, so the self-review is skipped. Add it as a repository secret to review this repository's own pull requests."
+
+      - name: Review this pull request
+        if: env.HAS_KEY == 'true'
+        uses: ./
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}

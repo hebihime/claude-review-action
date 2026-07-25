@@ -89,7 +89,7 @@ provider: anthropic
 # Only used by provider: fixture. The file is either a bare array of findings, or
 # an object {"findings": [...], "usage": {"input_tokens": N, "output_tokens": N}}
 # where the optional usage block drives the cost readout.
-# fixture_path: test/fixtures/findings.json
+# fixture_path: examples/findings.json
 
 # Only used by provider: dry-run. Receives the system prompt, the user message
 # and the tool schema, exactly as they would have been sent.

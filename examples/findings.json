@@ -1,0 +1,35 @@
+{
+  "findings": [
+    {
+      "path": "src/matrix.ts",
+      "line": 88,
+      "severity": "error",
+      "rule_id": "correctness",
+      "message": "Spreading every cell into Math.max throws RangeError: Maximum call stack size exceeded once the matrix has roughly 100k entries, so format() dies on exactly the large matrices where a formatted dump is most useful. Fold instead of spreading.",
+      "suggestion": "  const width = cells.flat().reduce((widest, cell) => Math.max(widest, cell.length), 0)"
+    },
+    {
+      "path": "src/matrix.ts",
+      "line": 54,
+      "severity": "error",
+      "rule_id": "correctness",
+      "message": "scale is the only operation here that does not call assertRectangular, so a ragged input passes straight through and returns a ragged result. That value then satisfies the Matrix type and reaches add or multiply, where the failure surfaces far from its cause.",
+      "suggestion": "export function scale(matrix: Matrix, factor: number): number[][] {\n  assertRectangular(matrix, 'matrix')"
+    },
+    {
+      "path": "src/slug.ts",
+      "line": 1,
+      "severity": "error",
+      "rule_id": "correctness",
+      "message": "Any input that ends in a non-alphanumeric character yields a trailing separator, so slug('Hello World!') returns 'hello-world-'. Used in a URL or an id that trailing hyphen makes two inputs that should collide produce different keys.",
+      "suggestion": "export const slug = (input: string): string => input.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')"
+    },
+    {
+      "path": "src/matrix.ts",
+      "line": 15,
+      "severity": "nit",
+      "rule_id": "clarity",
+      "message": "columns() reports the width of row 0, which is only the matrix's column count once rectangularity has been checked. transpose and multiply rely on that ordering; a reader adding a new operation will not see it. Say so in a one-line comment above the function."
+    }
+  ]
+}
