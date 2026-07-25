@@ -354,6 +354,18 @@ against the same comments:
 | Author fixes one bug | `0 created, 0 updated, 1 unchanged, 1 resolved, 0 revived` | That comment collapsed, `minimizedReason: resolved`, original text intact under the fold |
 | Finding returns | `0 created, 1 updated, 0 unchanged, 0 resolved, 1 revived` | The **same** comment id un-collapsed — no duplicate |
 
+The summary comment, on both sandbox PRs:
+
+| Check | Result |
+|-------|--------|
+| First run | One timeline comment created with the verdict header, the severity table and the run table |
+| Second run, same state | `Summary: unchanged` — GitHub reported `updated_at` still equal to `created_at` |
+| Never more than one | Both PRs carry exactly one comment matching the summary marker, across every run |
+| Cost readout | `2,418 input · 511 output` → **$0.0050**, and `cost_usd=0.0050` in a downstream workflow step |
+| No model call | `$0.00 — no model call was made`, `cost_usd=0.00` |
+| Unpriced model | `unknown — no published price on file for some-gateway/llm-v3`, and `cost_usd=` — **empty, not zero** |
+| Budget exhaustion | The five files the budget dropped listed by name with the tokens each needed, and `~2,765 of 2,800 estimated tokens — exhausted` |
+
 **Comments on unchanged context lines are accepted by GitHub.** That was an open question when the
 mapping was written. PR #2 answers it: a comment anchored to ` export function area(rect: Rect): number {`
 — a context line, note the leading space in its diff hunk — was created with `side: RIGHT`, `line: 6`
