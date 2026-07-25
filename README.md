@@ -249,15 +249,30 @@ is honoured before any API call, so a skipped PR costs nothing.
 
 ## Verified against real infrastructure
 
-Milestone 1 is exercised on GitHub-hosted runners from
+Every milestone is exercised on GitHub-hosted runners from
 [hebihime/claude-review-sandbox](https://github.com/hebihime/claude-review-sandbox), which runs the
-tagged action on a live pull request in three configurations:
+tagged action on live pull requests. Handling:
 
 | Scenario | Result |
 |----------|--------|
 | Normal PR | Prints the PR context and changed-file counts, sets all four outputs |
 | `skip-review` label | Notice, `skipped=true`, exit 0, zero API calls |
 | Deliberately invalid `github_token` | `Failed to fetch pull request #1 (HTTP 401): Bad credentials. The github_token is missing or invalid.` — one line, no stack trace |
+
+Idempotency, on [PR #2](https://github.com/hebihime/claude-review-sandbox/pull/2), each row a real run
+against the same comments:
+
+| Run | Log line | What GitHub showed |
+|-----|----------|--------------------|
+| First | `2 created, 0 updated, 0 unchanged, 0 resolved, 0 revived` | Two inline comments with committable suggestions |
+| Identical re-run | `0 created, 0 updated, 2 unchanged, 0 resolved, 0 revived` | `updated_at` still equal to `created_at` — not one byte rewritten |
+| Author fixes one bug | `0 created, 0 updated, 1 unchanged, 1 resolved, 0 revived` | That comment collapsed, `minimizedReason: resolved`, original text intact under the fold |
+| Finding returns | `0 created, 1 updated, 0 unchanged, 0 resolved, 1 revived` | The **same** comment id un-collapsed — no duplicate |
+
+**Comments on unchanged context lines are accepted by GitHub.** That was an open question when the
+mapping was written. PR #2 answers it: a comment anchored to ` export function area(rect: Rect): number {`
+— a context line, note the leading space in its diff hunk — was created with `side: RIGHT`, `line: 6`
+and no 422.
 
 Local `npm test` cannot catch metadata errors, because nothing parses `action.yml` locally. A
 `secrets.*` expression in an input description made the action fail to load on the runner before any
