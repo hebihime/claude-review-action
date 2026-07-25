@@ -1,5 +1,8 @@
 # claude-review-action
 
+[![CI](https://github.com/hebihime/claude-review-action/actions/workflows/ci.yml/badge.svg)](https://github.com/hebihime/claude-review-action/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Opinionated, configurable AI code review on every pull request — with idempotent comments and a cost readout.
 
 > **Status: milestone 1 of 6 (scaffold).** The action currently validates its inputs, resolves the
@@ -63,7 +66,25 @@ does not have to change when milestone 4 lands.
 ## Skipping a review
 
 Add the `skip-review` label to a pull request. The action logs a notice and exits successfully — the
-check goes green rather than being skipped, so required-check configuration keeps working.
+check goes green rather than being skipped, so required-check configuration keeps working. The label
+is honoured before any API call, so a skipped PR costs nothing.
+
+## Verified against real infrastructure
+
+Milestone 1 is exercised on GitHub-hosted runners from
+[hebihime/claude-review-sandbox](https://github.com/hebihime/claude-review-sandbox), which runs the
+tagged action on a live pull request in three configurations:
+
+| Scenario | Result |
+|----------|--------|
+| Normal PR | Prints the PR context and changed-file counts, sets all four outputs |
+| `skip-review` label | Notice, `skipped=true`, exit 0, zero API calls |
+| Deliberately invalid `github_token` | `Failed to fetch pull request #1 (HTTP 401): Bad credentials. The github_token is missing or invalid.` — one line, no stack trace |
+
+Local `npm test` cannot catch metadata errors, because nothing parses `action.yml` locally. A
+`secrets.*` expression in an input description made the action fail to load on the runner before any
+code ran; `test/action-yml.test.ts` now asserts that `action.yml` uses only contexts available at
+metadata-parse time.
 
 ## Local development
 
