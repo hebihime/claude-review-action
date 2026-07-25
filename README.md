@@ -5,11 +5,12 @@
 
 Opinionated, configurable AI code review on every pull request — with idempotent comments and a cost readout.
 
-> **Status: milestone 4 of 6.** The action runs the review end to end: it loads and validates
+> **Status: milestone 5 of 6.** The review is feature-complete: the action loads and validates
 > `.claude-review.yml`, fetches the diff, decides what fits the token budget, asks the model for
 > findings through a forced tool call, maps each finding onto a line a comment can actually anchor
-> to, and posts them as inline review comments that update in place on every re-run. Still to come:
-> the summary comment, the verdict header and the USD cost readout, all in milestone 5.
+> to, posts them as inline review comments that update in place on every re-run, and closes with a
+> single summary comment carrying the verdict, what was skipped, and what the run cost. Milestone 6
+> is documentation, dogfooding and the tagged release.
 
 ## Build order
 
@@ -19,8 +20,8 @@ Opinionated, configurable AI code review on every pull request — with idempote
 | 2 | Config loading + validation, diff fetching, ignore/budget logic | ✅ done |
 | 3 | Model review call, structured findings, diff→position mapping | ✅ done |
 | 4 | Inline comments + idempotent update logic | ✅ done |
-| 5 | Summary comment, verdict, cost readout | ⬜ next |
-| 6 | Tests green, full README, tag `v1` | ⬜ |
+| 5 | Summary comment, verdict, cost readout | ✅ done |
+| 6 | Tests green, full README, tag `v1` | ⬜ next |
 
 ## Inputs
 
@@ -36,7 +37,7 @@ Opinionated, configurable AI code review on every pull request — with idempote
 |--------|-------------|
 | `verdict` | `approve`, `comment`, or `request_changes`. |
 | `findings_count` | Findings that survived filtering and were posted. |
-| `cost_usd` | Estimated USD cost of the model calls in this run. |
+| `cost_usd` | Estimated USD cost of this run, to four decimals. `0.00` when no model call was made; **empty** when the configured model has no published price on file — an unpriced run is not a free one. |
 | `skipped` | `true` when the run exited early (not a PR, or `skip-review` label present). |
 
 ## Quickstart
@@ -130,6 +131,22 @@ would cost a network round trip per run. It is tuned to over-estimate, because t
 number is to stop a run from overshooting. The **cost readout in the summary comment uses the usage
 the API actually reports**, never this estimate.
 
+#### What the cost readout will and will not tell you
+
+Prices come from a table in [`src/pricing.ts`](src/pricing.ts) — Anthropic list prices, checked
+`2026-07`, with cache reads billed at 0.1× the input rate and cache writes at 1.25×. Bedrock, Vertex
+and dated model ids resolve to the same entry, so `anthropic.claude-sonnet-5-v1:0` prices correctly.
+
+**A model that is not in that table produces no dollar figure at all.** The summary prints the exact
+token counts and says there is no published price on file, and `cost_usd` comes back empty rather
+than `0.00`. This action can be pinned at `v1` for a year and `model:` can point at anything a
+gateway accepts; a confident number derived from a guessed rate would be worse than no number,
+because a spend guard would happily pass a run it could not price. Promotional rates are deliberately
+not encoded — they expire, and a stale discount under-reports the bill.
+
+Costs are estimates of API list price. They are not your invoice, and they do not include whatever
+your provider charges on top.
+
 ## How the review works
 
 One model call per run, not one per file. The system prompt carries your rules; the user message
@@ -221,7 +238,75 @@ Details that matter:
   anchored; that comment is reported and the rest are posted normally. Any other status (401, 403,
   5xx) will fail identically for every comment, so it is raised once rather than `max_comments` times.
 
-### Providers
+## The summary comment
+
+Every run ends with exactly one comment on the pull request describing the run itself:
+
+```markdown
+<!-- claude-review:v1:summary -->
+## 🛑 Claude review: REQUEST CHANGES
+
+Reviewed 1 file(s): 3 finding(s), 2 commented inline. Changes are requested.
+
+### Findings
+
+| Severity | Commented | Not commented |
+|:--|--:|--:|
+| Error | 1 | 0 |
+| Warning | 1 | 0 |
+| Nit | 0 | 1 |
+
+- 1 finding(s) were below `min_severity_to_comment: warn` and were not commented on. They do not affect the verdict.
+- 1 finding(s) cited a line that is not part of the diff and could not be anchored to a comment. They were discarded.
+
+<details><summary><b>2 file(s) were not reviewed</b></summary>
+
+**Ignored by pattern** (1)
+
+- `package-lock.json` — matched an ignore pattern
+
+**No text diff available** (1)
+
+- `assets/logo.png` — no text diff available (binary, or too large for the GitHub API to inline)
+
+</details>
+
+### This run
+
+| | |
+|:--|:--|
+| Model | `claude-haiku-4-5` via provider `anthropic` |
+| Tokens | 3,128 input · 604 output |
+| Estimated cost | **$0.0061** at list prices as of 2026-07 |
+| Prompt budget | ~1,664 of 150,000 estimated tokens |
+| Inline comments | 2 created, 0 updated, 0 unchanged, 1 resolved, 0 revived |
+| Workflow run | [logs](…) for `abcdef1` |
+```
+
+Design notes:
+
+- **It is an issue comment, not a review comment.** It is about the pull request as a whole and has
+  no line to anchor to, so it belongs in the conversation timeline where the author will see it.
+- **The verdict is a header, not a GitHub review event.** The action never submits an approval. A bot
+  approval can satisfy a required-review rule and let a human review be skipped entirely, which is a
+  worse outcome than any review this action could produce. `fail_on_request_changes: true` is the
+  opt-in for making the verdict actually block a merge, via the check run rather than the review.
+- **Its idempotency rule is the mirror image of the inline comments'.** An inline comment body must be
+  a pure function of its finding, so a re-run rewrites nothing. The summary deliberately carries what
+  changed about the *run* — token counts, cost, the link to this workflow run — so a re-run is
+  expected to rewrite it. A fixed marker (`claude-review:v1:summary`, not a fingerprint) is what
+  guarantees there is never a second one.
+- **Nothing is silently dropped.** Findings held back by `min_severity_to_comment` are counted and the
+  key is named; findings held back by `max_comments` are counted and the comment says plainly that
+  they still count towards the verdict; findings the model cited on a line that is not in the diff are
+  counted as discarded. Files that were never reviewed are listed by reason. A summary that only said
+  "1 finding" would read as a clean review of the whole pull request.
+- **Two runs racing to post the first summary converge.** Two pushes in quick succession start two
+  workflow runs, and both can list the comments before either creates one. The *oldest* live summary
+  wins every time — never the newest, or the survivor would change on every run — and the duplicate is
+  folded away and collapsed rather than deleted, because it may already have replies.
+
+## Providers
 
 `provider` decides where the review call goes. `anthropic` is the real Messages API and the default.
 The other two exist so the whole downstream pipeline — position mapping, severity filtering, comment

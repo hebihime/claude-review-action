@@ -69,12 +69,22 @@ interface StoredComment {
   body: string
 }
 
+interface StoredIssueComment {
+  id: number
+  node_id: string
+  body: string
+  html_url: string
+}
+
 let comments: StoredComment[] = []
+/** The summary lives here: it is an issue comment, on a different endpoint. */
+let issueComments: StoredIssueComment[] = []
 let graphqlCalls: string[] = []
 let nextCommentId = 1
 
 function resetApiState(): void {
   comments = []
+  issueComments = []
   graphqlCalls = []
   nextCommentId = 1
 }
@@ -135,6 +145,39 @@ beforeAll(async () => {
       const update = /^\/repos\/octo\/demo\/pulls\/comments\/(\d+)/.exec(url)
       if (update) {
         const target = comments.find(comment => comment.id === Number(update[1]))
+        if (!target) {
+          res.statusCode = 404
+          res.end(JSON.stringify({ message: 'No comment' }))
+          return
+        }
+        target.body = (JSON.parse(await readBody(req)) as { body: string }).body
+        res.end(JSON.stringify(target))
+        return
+      }
+
+      if (url.startsWith('/repos/octo/demo/issues/1/comments')) {
+        if (method === 'POST') {
+          const posted = JSON.parse(await readBody(req)) as { body: string }
+          const id = nextCommentId++
+          const created: StoredIssueComment = {
+            id,
+            node_id: `NODE_ISSUE_${id}`,
+            body: posted.body,
+            html_url: `https://github.com/octo/demo/pull/1#issuecomment-${id}`
+          }
+          issueComments.push(created)
+          res.statusCode = 201
+          res.end(JSON.stringify(created))
+          return
+        }
+        res.end(JSON.stringify(issueComments))
+        return
+      }
+
+      // updateComment: PATCH /repos/{o}/{r}/issues/comments/{id}
+      const issueUpdate = /^\/repos\/octo\/demo\/issues\/comments\/(\d+)/.exec(url)
+      if (issueUpdate) {
+        const target = issueComments.find(comment => comment.id === Number(issueUpdate[1]))
         if (!target) {
           res.statusCode = 404
           res.end(JSON.stringify({ message: 'No comment' }))
@@ -427,5 +470,100 @@ describe('the committed bundle, posting inline comments', () => {
 
     expect(second.output).toContain('none — provider "dry-run" produced no findings')
     expect(comments[0]?.body).not.toContain('no longer reported')
+  })
+})
+
+/** A fixture carrying the `usage` block a real API response would have. */
+const FINDING_WITH_USAGE = JSON.stringify({
+  findings: JSON.parse(ONE_FINDING),
+  usage: { input_tokens: 2431, output_tokens: 512 }
+})
+
+describe('the committed bundle, posting the summary comment', () => {
+  it('posts one summary carrying the verdict, the findings table and the run link', async () => {
+    const result = await runBundle(FIXTURE_CONFIG, { withApi: true, files: { 'findings.json': ONE_FINDING } })
+
+    expect(result.status).toBe(0)
+    expect(issueComments).toHaveLength(1)
+    const body = issueComments[0]?.body ?? ''
+    expect(body).toContain('<!-- claude-review:v1:summary -->')
+    expect(body).toContain('## 🛑 Claude review: REQUEST CHANGES')
+    expect(body).toContain('| Error | 1 | 0 |')
+    expect(body).toContain('`claude-haiku-4-5` via provider `fixture`')
+    expect(body).toContain('1 created, 0 updated, 0 unchanged, 0 resolved, 0 revived')
+    expect(body).toContain('/actions/runs/1')
+    // Files the run never looked at are named, not silently dropped.
+    expect(body).toContain('`package-lock.json`')
+    expect(body).toContain('`assets/logo.png`')
+    expect(result.output).toContain('Summary:       created')
+  })
+
+  it('updates the same summary on a re-run instead of posting a second one', async () => {
+    await runBundle(FIXTURE_CONFIG, { withApi: true, files: { 'findings.json': ONE_FINDING } })
+    const second = await runBundle(FIXTURE_CONFIG, { withApi: true, files: { 'findings.json': '[]' } })
+
+    expect(issueComments).toHaveLength(1)
+    expect(second.output).toContain('Summary:       updated')
+    // Same comment, now reporting the clean review.
+    expect(issueComments[0]?.body).toContain('Claude review: APPROVE')
+    expect(issueComments[0]?.body).toContain('found nothing to report')
+  })
+
+  it('settles: repeated identical runs stop rewriting it', async () => {
+    // The summary is *expected* to change between runs — it reports the run, and
+    // the second run's inline-comment counts genuinely differ from the first's
+    // ("1 created" becomes "1 unchanged"). From the third run on, nothing about an
+    // unchanged pull request differs, so nothing should be written. Anything that
+    // varies on its own — a clock, a nonce — would show up right here.
+    const files = { 'findings.json': ONE_FINDING }
+    await runBundle(FIXTURE_CONFIG, { withApi: true, files })
+    const second = await runBundle(FIXTURE_CONFIG, { withApi: true, files })
+    const third = await runBundle(FIXTURE_CONFIG, { withApi: true, files })
+
+    expect(second.output).toContain('Summary:       updated')
+    expect(third.output).toContain('Summary:       unchanged')
+    expect(issueComments).toHaveLength(1)
+  })
+
+  it('turns the API-reported usage into a dollar figure and a cost_usd output', async () => {
+    const result = await runBundle(FIXTURE_CONFIG, {
+      withApi: true,
+      files: { 'findings.json': FINDING_WITH_USAGE }
+    })
+
+    expect(issueComments[0]?.body).toContain('2,431 input · 512 output')
+    expect(issueComments[0]?.body).toContain('**$0.0050**')
+
+    const outputs = readFileSync(path.join(result.workspace, 'output.txt'), 'utf8')
+    expect(outputs).toMatch(/cost_usd<<.*\n0\.0050/)
+  })
+
+  it('reports 0.00 rather than a guess when no model was called', async () => {
+    const result = await runBundle(FIXTURE_CONFIG, { withApi: true, files: { 'findings.json': ONE_FINDING } })
+
+    expect(issueComments[0]?.body).toContain('no model call was made')
+    const outputs = readFileSync(path.join(result.workspace, 'output.txt'), 'utf8')
+    expect(outputs).toMatch(/cost_usd<<.*\n0\.00/)
+  })
+
+  it('leaves cost_usd empty for a model with no published price', async () => {
+    // Unknown is not free: a spend guard must not pass a run it could not price.
+    const config = `${FIXTURE_CONFIG}model: llm-of-the-week\n`
+    const result = await runBundle(config, { withApi: true, files: { 'findings.json': FINDING_WITH_USAGE } })
+
+    expect(issueComments[0]?.body).toContain('no published price on file')
+    const outputs = readFileSync(path.join(result.workspace, 'output.txt'), 'utf8')
+    // An empty value between the two delimiter lines, not the string "0.00".
+    expect(outputs).toMatch(/cost_usd<<(\S+)\n\n\1/)
+  })
+
+  it('writes no summary at all in dry-run mode', async () => {
+    await runBundle(FIXTURE_CONFIG, { withApi: true, files: { 'findings.json': ONE_FINDING } })
+    const before = issueComments[0]?.body
+    const second = await runBundle('provider: dry-run\ndry_run_path: prompt.txt\n', { withApi: true })
+
+    expect(second.output).toContain('Summary:       none — provider "dry-run"')
+    expect(issueComments).toHaveLength(1)
+    expect(issueComments[0]?.body).toBe(before)
   })
 })

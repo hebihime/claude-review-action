@@ -43,7 +43,7 @@ function stripMarkers(body: string): string {
   return body.replace(MARKER_PATTERN, '').split(RESOLVED_MARKER).join('').trim()
 }
 
-const SEVERITY_LABEL: Record<Severity, string> = {
+export const SEVERITY_LABEL: Record<Severity, string> = {
   error: 'Error',
   warn: 'Warning',
   nit: 'Nit'
@@ -284,7 +284,7 @@ export interface SyncResult {
  * `minimizeComment` classifiers. RESOLVED and OUTDATED are the two that describe
  * what actually happened, and GitHub renders both as a collapsed comment.
  */
-const CLASSIFIER: Record<ResolveReason, string> = { gone: 'RESOLVED', superseded: 'OUTDATED' }
+export const CLASSIFIER: Record<ResolveReason, string> = { gone: 'RESOLVED', superseded: 'OUTDATED' }
 
 const MINIMIZE_MUTATION = `mutation($id: ID!, $classifier: ReportedContentClassifiers!) {
   minimizeComment(input: { subjectId: $id, classifier: $classifier }) { clientMutationId }
@@ -297,17 +297,21 @@ const UNMINIMIZE_MUTATION = `mutation($id: ID!) {
 /**
  * Collapse or expand a comment. Best effort, by design.
  *
- * This is the only GraphQL call in the action, and the rewritten body already says
- * the comment is resolved. If the mutation is unavailable — an older GitHub
+ * This is the only GraphQL in the action, and the rewritten body already says the
+ * comment is resolved. If the mutation is unavailable — an older GitHub
  * Enterprise, a token without the scope — the review is still correct, just
  * slightly noisier, and failing the run over presentation would be absurd.
+ *
+ * Returns the failure message rather than throwing, so the caller can report it
+ * once instead of once per comment. Shared with the summary comment, which
+ * collapses its own superseded duplicates the same way.
  */
-async function setCollapsed(octokit: Octokit, comment: ExistingComment, reason: ResolveReason | null): Promise<string | null> {
+export async function setCollapsed(octokit: Octokit, nodeId: string, classifier: string | null): Promise<string | null> {
   try {
-    if (reason) {
-      await octokit.graphql(MINIMIZE_MUTATION, { id: comment.nodeId, classifier: CLASSIFIER[reason] })
+    if (classifier) {
+      await octokit.graphql(MINIMIZE_MUTATION, { id: nodeId, classifier })
     } else {
-      await octokit.graphql(UNMINIMIZE_MUTATION, { id: comment.nodeId })
+      await octokit.graphql(UNMINIMIZE_MUTATION, { id: nodeId })
     }
     return null
   } catch (error) {
@@ -354,7 +358,7 @@ export async function syncComments(octokit: Octokit, pr: PullRequestContext, pla
         )
         if (post.action === 'revive') {
           result.revived += 1
-          collapseNote ??= await setCollapsed(octokit, existing, null)
+          collapseNote ??= await setCollapsed(octokit, existing.nodeId, null)
         } else {
           result.updated += 1
         }
@@ -394,7 +398,7 @@ export async function syncComments(octokit: Octokit, pr: PullRequestContext, pla
         })
       )
       result.resolved += 1
-      collapseNote ??= await setCollapsed(octokit, existing, reason)
+      collapseNote ??= await setCollapsed(octokit, existing.nodeId, CLASSIFIER[reason])
     } catch (error) {
       if (!isSingleCommentRejection(error)) throw error
       result.failures.push({ path: existing.path, line: existing.line, detail: (error as GitHubApiError).message })

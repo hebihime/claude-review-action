@@ -29,7 +29,7 @@ outputs:
   findings_count:
     description: 'Number of findings that survived filtering and were posted.'
   cost_usd:
-    description: 'Estimated USD cost of the model calls made during this run.'
+    description: 'Estimated USD cost of this run, from the token usage the API reported. 0.00 when no model call was made. Empty when the configured model has no published price on file, because an unpriced run is not a free one.'
   skipped:
     description: 'true when the run exited early (not a pull request, or the skip-review label was present).'
 

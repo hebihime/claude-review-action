@@ -1,7 +1,7 @@
 import * as core from '@actions/core'
 import { readInputs } from './inputs.js'
 import { hasSkipLabel, loadPullRequestContext, SKIP_REVIEW_LABEL } from './context.js'
-import { callGitHub, createOctokit } from './github.js'
+import { callGitHub, createOctokit, type Octokit } from './github.js'
 import { loadConfig, type ReviewConfig } from './config.js'
 import { fetchChangedFiles, GITHUB_MAX_FILES } from './diff.js'
 import { planReview, type ReviewPlan, type SkippedFile } from './plan.js'
@@ -16,8 +16,9 @@ import {
   type MappedFinding,
   type SelectionResult
 } from './findings.js'
-import { decideVerdict, type Verdict } from './verdict.js'
+import { decideVerdict } from './verdict.js'
 import { listReviewComments, planComments, syncComments, type SyncResult } from './comments.js'
+import { renderSummary, summaryCostOutput, syncSummary, type SummaryInput } from './summary.js'
 
 /** Group the skipped files by reason so the log stays short on a big PR. */
 function logSkipped(skipped: readonly SkippedFile[]): void {
@@ -166,13 +167,13 @@ function logUsage(outcome: ReviewOutcome, config: ReviewConfig): void {
 }
 
 /**
- * Milestone 4: everything up to the summary comment.
+ * The whole review, end to end.
  *
  * Resolves the PR, loads and validates the config, fetches the diff, decides
  * what fits the token budget, asks the model for findings, maps each one onto a
- * line a comment can actually anchor to, and reconciles those findings against
- * the comments already on the pull request. The summary comment, the verdict
- * header and the USD cost readout land in milestone 5.
+ * line a comment can actually anchor to, reconciles those findings against the
+ * comments already on the pull request, and posts the one summary comment that
+ * carries the verdict and what the run cost.
  */
 export async function run(): Promise<void> {
   const inputs = readInputs()
@@ -221,7 +222,19 @@ export async function run(): Promise<void> {
 
   if (plan.files.length === 0) {
     core.notice('No reviewable files in this pull request — nothing was sent to the model.')
-    finish(emptySelection(), config)
+    // Still summarised, and deliberately so: "every file here was ignored" is a
+    // result the author needs to see, and a silent success looks like a review
+    // that found nothing wrong.
+    await conclude(octokit, {
+      pr,
+      config,
+      selection: emptySelection(),
+      mappedCount: 0,
+      dropped: [],
+      plan,
+      outcome: { provider: config.provider, toolInput: { findings: [] }, usage: null, truncated: false },
+      comments: null
+    })
     return
   }
 
@@ -241,20 +254,67 @@ export async function run(): Promise<void> {
   // `dry-run` stopped before the model, so its empty findings list is "we did not
   // look", not "we looked and found nothing". Reconciling against it would resolve
   // every comment on the pull request and then recreate them on the next real run.
+  let comments: SyncResult | null = null
   if (outcome.provider === 'dry-run') {
     core.info('Comments:      none — provider "dry-run" produced no findings to reconcile against.')
   } else {
     const existing = await listReviewComments(octokit, pr)
     const reviewedPaths = new Set(plan.files.map(planned => planned.file.path))
     const commentPlan = planComments(selection.selected, existing, reviewedPaths)
-    logComments(await syncComments(octokit, pr, commentPlan))
+    comments = await syncComments(octokit, pr, commentPlan)
+    logComments(comments)
   }
 
-  finish(selection, config)
+  await conclude(octokit, {
+    pr,
+    config,
+    selection,
+    mappedCount: findings.length,
+    dropped,
+    plan,
+    outcome,
+    comments
+  })
 }
 
 function emptySelection(): SelectionResult {
   return { selected: [], suppressed: [] }
+}
+
+/** Everything the summary needs except the verdict, which `conclude` derives. */
+type RunResult = Omit<SummaryInput, 'verdict'>
+
+/**
+ * Decide the verdict, publish the summary, and set the outputs.
+ *
+ * One function so the two exits from `run` — nothing reviewable, and a completed
+ * review — cannot drift apart and report differently.
+ */
+async function conclude(octokit: Octokit, result: RunResult): Promise<void> {
+  const summary: SummaryInput = { ...result, verdict: decideVerdict(result.selection, result.config) }
+  await postSummary(octokit, summary)
+  finish(summary)
+}
+
+async function postSummary(octokit: Octokit, summary: SummaryInput): Promise<void> {
+  // Same rule as the inline comments: a provider that never looked at the code
+  // must not overwrite the summary of a run that did.
+  if (summary.outcome.provider === 'dry-run') {
+    core.info('Summary:       none — provider "dry-run" writes nothing to the pull request.')
+    return
+  }
+
+  const result = await syncSummary(octokit, summary.pr, renderSummary(summary))
+  core.info(`Summary:       ${result.action} — ${result.url}`)
+
+  if (result.superseded > 0) {
+    core.warning(
+      `${result.superseded} duplicate summary comment(s) were found and collapsed. Two workflow runs on this pull request most likely raced to post the first one.`
+    )
+  }
+  if (result.collapseNote) {
+    core.info(`The superseded summary comment could not be collapsed: ${result.collapseNote}.`)
+  }
 }
 
 /**
@@ -264,15 +324,14 @@ function emptySelection(): SelectionResult {
  * in with `fail_on_request_changes`. A failing check is a merge blocker, and a
  * model is not reliable enough to hold that veto by default.
  */
-function finish(selection: SelectionResult, config: ReviewConfig): void {
-  const verdict: Verdict = decideVerdict(selection, config)
+function finish(summary: SummaryInput): void {
+  const { verdict, config } = summary
 
   core.setOutput('skipped', 'false')
   core.setOutput('verdict', verdict)
-  core.setOutput('findings_count', String(selection.selected.length))
-  // The pricing table and the USD readout land with the summary comment in
-  // milestone 5; reporting a made-up number here would be worse than zero.
-  core.setOutput('cost_usd', '0.00')
+  core.setOutput('findings_count', String(summary.selection.selected.length))
+  // Empty when the model has no published price on file — see `costOutputValue`.
+  core.setOutput('cost_usd', summaryCostOutput(summary))
 
   core.info(`Verdict:       ${verdict}`)
 
