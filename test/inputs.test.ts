@@ -48,11 +48,13 @@ describe('readInputs', () => {
     expect(out).toBe('key=*** token=***')
   })
 
-  it('fails with a helpful message when the API key is missing', () => {
+  it('accepts a missing API key, leaving the decision to the provider', () => {
+    // Only `provider: anthropic` needs a key, and the provider lives in the
+    // config file, which has not been read at this point. Demanding one here
+    // would make `dry-run` and `fixture` impossible to use without a secret.
     setInput('github_token', 'ghp_testtoken0123456789')
 
-    expect(() => readInputs()).toThrow(InputError)
-    expect(() => readInputs()).toThrow(/secrets\.ANTHROPIC_API_KEY/)
+    expect(readInputs().anthropicApiKey).toBe('')
   })
 
   it('fails when the github token resolves to empty', () => {

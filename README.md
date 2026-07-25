@@ -5,11 +5,12 @@
 
 Opinionated, configurable AI code review on every pull request — with idempotent comments and a cost readout.
 
-> **Status: milestone 2 of 6.** The action validates its inputs, resolves the pull request, honours
-> the `skip-review` label, loads and validates `.claude-review.yml`, fetches the diff, and decides
-> which files it would review under the token budget — logging every file it skipped and why. It does
-> **not** call the model or post comments yet. The idempotency and cost-readout docs land with those
-> features.
+> **Status: milestone 3 of 6.** The action runs the full review pipeline: it loads and validates
+> `.claude-review.yml`, fetches the diff, decides what fits the token budget, asks the model for
+> findings through a forced tool call, and maps each finding onto a line a comment can actually
+> anchor to — dropping and counting the ones that do not map. It reports a verdict and a findings
+> count as outputs. It does **not** post comments yet; that is milestone 4, and the cost readout
+> lands with the summary comment in milestone 5.
 
 ## Build order
 
@@ -17,8 +18,8 @@ Opinionated, configurable AI code review on every pull request — with idempote
 |---|-----------|-------|
 | 1 | Scaffold, `action.yml`, ncc build, hello-world run | ✅ done |
 | 2 | Config loading + validation, diff fetching, ignore/budget logic | ✅ done |
-| 3 | Model review call, structured findings, diff→position mapping | ⬜ next |
-| 4 | Inline comments + idempotent update logic | ⬜ |
+| 3 | Model review call, structured findings, diff→position mapping | ✅ done |
+| 4 | Inline comments + idempotent update logic | ⬜ next |
 | 5 | Summary comment, verdict, cost readout | ⬜ |
 | 6 | Tests green, full README, tag `v1` | ⬜ |
 
@@ -26,7 +27,7 @@ Opinionated, configurable AI code review on every pull request — with idempote
 
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `anthropic_api_key` | yes | — | Anthropic API key. Pass from a repository secret. |
+| `anthropic_api_key` | only for `provider: anthropic` | — | Anthropic API key. Pass from a repository secret. Not needed for `dry-run` or `fixture`. |
 | `config_path` | no | `.claude-review.yml` | Review config file, relative to the repo root. |
 | `github_token` | no | `${{ github.token }}` | Token used for all GitHub API calls. |
 
@@ -125,13 +126,70 @@ would cost a network round trip per run. It is tuned to over-estimate, because t
 number is to stop a run from overshooting. The **cost readout in the summary comment uses the usage
 the API actually reports**, never this estimate.
 
+## How the review works
+
+One model call per run, not one per file. The system prompt carries your rules; the user message
+carries every file that fit the budget, each diff rendered with a line-number gutter:
+
+```
+### src/total.js
+@@ -1,4 +1,6 @@
+     1 | export function total(items) {
+       |-  return items.count
+     2 |+  let sum = 0
+     3 |+  for (let i = 0; i <= items.length; i++) sum += items[i]
+     4 |+  return sum
+     5 | }
+```
+
+Structured output is **forced through tool use** rather than requested in prose: `tool_choice` is
+pinned to a `report_findings` tool whose schema is `{path, line, severity, rule_id, message,
+suggestion?}`. The model cannot answer with an apology or a markdown table.
+
+### Findings that don't map are dropped, not guessed
+
+A review comment can only attach to a line GitHub considers part of the diff. Every finding is
+checked against the parsed patch hunks and dropped if it fails, with the reason logged and counted:
+
+| Drop reason | Meaning |
+|-------------|---------|
+| `unmappable-line` | Cited a line that is not in the diff. Logged as a warning — it usually means a prompt problem, and it must not look like a clean review. |
+| `unknown-path` | Cited a file that was not sent for review. |
+| `unknown-rule` | Cited a rule id that is not in your config. |
+| `duplicate` | Same file, line and rule as a finding already kept. |
+| `malformed` | Did not match the tool schema. Dropped individually, so one bad entry cannot discard the rest. |
+
+The line-number gutter above exists precisely to make `unmappable-line` rare: without it the model
+has to count lines from the hunk header, and every off-by-one becomes a dropped finding.
+
+Two deliberate choices worth knowing:
+
+- **The rule's severity wins over the model's.** Your config decides what blocks a merge, so the
+  model cannot promote a finding past `min_severity_to_comment` or into a REQUEST CHANGES verdict.
+  It also keeps re-runs stable — a model that labelled the same finding `warn` then `error` would
+  rewrite a comment that had not actually changed.
+- **Unchanged context lines are commentable.** A finding often needs to point at the line a change
+  broke, not at the change itself.
+
 ### Providers
 
 `provider` decides where the review call goes. `anthropic` is the real Messages API and the default.
 The other two exist so the whole downstream pipeline — position mapping, severity filtering, comment
 posting, idempotent updates, the summary, and the cost math — can be exercised without spending
-anything: `dry-run` writes the assembled prompt to `dry_run_path` and stops, and `fixture` replays a
-findings JSON from `fixture_path` as if the model had returned it.
+anything, and **neither requires an API key**:
+
+- `dry-run` writes the fully assembled prompt to `dry_run_path` and stops before the call. The file
+  is a readable artefact: system prompt, user message, and tool schema, exactly as they would be
+  sent. Upload it with `actions/upload-artifact` to inspect what a run would have cost.
+- `fixture` replays a findings JSON from `fixture_path` as if the model had returned it. The file is
+  either a bare array of findings or `{"findings": [...], "usage": {...}}`; the optional `usage`
+  block lets the cost readout be exercised with realistic numbers.
+
+```yaml
+# .claude-review.yml — review the pipeline, spend nothing
+provider: fixture
+fixture_path: test/fixtures/findings.json
+```
 
 ## Skipping a review
 

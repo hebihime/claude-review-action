@@ -74,9 +74,10 @@ model: claude-haiku-4-5
 
 # Where the review call goes.
 #   anthropic — the real Messages API (default). Needs anthropic_api_key.
-#   dry-run   — write the assembled prompt to dry_run_path and stop. No API call.
+#   dry-run   — write the assembled prompt to dry_run_path and stop. No API call,
+#               and no API key required.
 #   fixture   — replay a findings JSON from fixture_path through the rest of the
-#               pipeline. No API call.
+#               pipeline. No API call, and no API key required.
 #
 # dry-run and fixture exist so comment posting, idempotency, filtering and the
 # cost readout can be exercised end to end at zero cost.
@@ -85,8 +86,13 @@ provider: anthropic
 # Optional: absolute base URL for a gateway, Bedrock or Vertex endpoint.
 # base_url: https://gateway.example.com
 
-# Only used by the matching provider.
+# Only used by provider: fixture. The file is either a bare array of findings, or
+# an object {"findings": [...], "usage": {"input_tokens": N, "output_tokens": N}}
+# where the optional usage block drives the cost readout.
 # fixture_path: test/fixtures/findings.json
+
+# Only used by provider: dry-run. Receives the system prompt, the user message
+# and the tool schema, exactly as they would have been sent.
 dry_run_path: claude-review-prompt.txt
 
 verdict:

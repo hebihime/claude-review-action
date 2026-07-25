@@ -33,10 +33,16 @@ jobs:
 
       # dist/ is committed because GitHub runs the bundled file directly.
       # If a PR changes src/ without rebuilding, the Action would ship stale code.
+      #
+      # `git status --porcelain`, not `git diff`: the ESM bundle emits numbered
+      # chunk files for dynamically imported dependencies, and a newly generated
+      # chunk is untracked. `git diff` cannot see an untracked file, so it would
+      # report a clean tree while the committed dist/ was missing a chunk the
+      # bundle imports at runtime.
       - name: Verify dist/ is up to date
         run: |
-          if ! git diff --quiet -- dist/; then
+          if [ -n "$(git status --porcelain -- dist/)" ]; then
             echo "::error::dist/ is out of date. Run 'npm run build' and commit the result."
-            git diff --stat -- dist/
+            git status --porcelain -- dist/
             exit 1
           fi

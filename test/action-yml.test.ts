@@ -75,8 +75,12 @@ describe('action.yml contract', () => {
     ])
   })
 
-  it('requires only the API key', () => {
-    expect(action.inputs?.['anthropic_api_key']?.required).toBe(true)
+  it('marks no input as required', () => {
+    // The API key is conditionally required — only `provider: anthropic` needs
+    // one — and that condition lives in the review config, which GitHub cannot
+    // see. Declaring it required here would block `dry-run` and `fixture` runs
+    // behind a secret they never use. `requestReview` enforces it instead.
+    expect(action.inputs?.['anthropic_api_key']?.required).toBe(false)
     expect(action.inputs?.['config_path']?.required).toBe(false)
     expect(action.inputs?.['github_token']?.required).toBe(false)
   })

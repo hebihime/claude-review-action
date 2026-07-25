@@ -2,6 +2,11 @@ import * as core from '@actions/core'
 import { registerSecret } from './redact.js'
 
 export interface ActionInputs {
+  /**
+   * Empty when unset. Not validated here: only `provider: anthropic` needs a
+   * key, and the provider lives in the config file, which is not loaded yet.
+   * `requestReview` raises the error, naming the provider that required it.
+   */
   anthropicApiKey: string
   configPath: string
   githubToken: string
@@ -31,11 +36,6 @@ export function readInputs(): ActionInputs {
     registerSecret(githubToken)
   }
 
-  if (!anthropicApiKey) {
-    throw new InputError(
-      'Input "anthropic_api_key" is required. Pass it from a repository secret, e.g. anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}'
-    )
-  }
   if (!githubToken) {
     throw new InputError(
       'Input "github_token" resolved to an empty string. Leave it unset to use ${{ github.token }}, or pass a token explicitly.'

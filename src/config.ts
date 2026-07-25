@@ -189,6 +189,22 @@ function isNotFound(error: unknown): boolean {
 }
 
 /**
+ * Resolve a repo-relative path against the workspace, refusing to escape it.
+ *
+ * Every path in this action comes from a config file or an action input, both of
+ * which are attacker-controlled on a fork pull request. `label` names the key so
+ * the error says which one was wrong.
+ */
+export function resolveInsideWorkspace(relativePath: string, workspace: string, label: string): string {
+  const absolute = path.resolve(workspace, relativePath)
+  const relative = path.relative(workspace, absolute)
+  if (relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw new ConfigError(`${label} must stay inside the repository. Got: ${relativePath}`)
+  }
+  return absolute
+}
+
+/**
  * Read and validate `.claude-review.yml` from the checked-out workspace.
  *
  * A missing file at the *default* path is normal — the action runs on built-in
@@ -196,11 +212,7 @@ function isNotFound(error: unknown): boolean {
  * mistake worth failing on, because the repo asked for a config that is not there.
  */
 export function loadConfig(configPath: string, workspace: string = resolveWorkspace()): LoadedConfig {
-  const absolute = path.resolve(workspace, configPath)
-  const relative = path.relative(workspace, absolute)
-  if (relative.startsWith('..') || path.isAbsolute(relative)) {
-    throw new ConfigError(`config_path must stay inside the repository. Got: ${configPath}`)
-  }
+  const absolute = resolveInsideWorkspace(configPath, workspace, 'config_path')
 
   let text: string
   try {

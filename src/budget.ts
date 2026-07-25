@@ -18,8 +18,16 @@ export const CHARS_PER_TOKEN = 3.5
 /** Per-file prompt scaffolding: the path header, framing, and response overhead. */
 export const PER_FILE_OVERHEAD_TOKENS = 220
 
-/** One-time cost of the system prompt and the findings tool schema. */
-export const BASE_OVERHEAD_TOKENS = 900
+/**
+ * One-time cost of the system prompt and the findings tool schema.
+ *
+ * Measured against the real prompt text rather than guessed — `test/budget.test.ts`
+ * fails if this drops below what `src/prompt.ts` actually costs, so editing the
+ * prompt cannot silently make every run overshoot its budget. The margin above
+ * the measured figure covers the user-message header and the request envelope,
+ * neither of which is attributed to any single file.
+ */
+export const BASE_OVERHEAD_TOKENS = 1150
 
 export function estimateTokens(text: string): number {
   return Math.ceil(text.length / CHARS_PER_TOKEN)
