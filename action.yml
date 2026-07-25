@@ -7,8 +7,12 @@ branding:
   color: 'purple'
 
 inputs:
+  # NOTE: GitHub evaluates ${{ }} expressions anywhere in this file, including
+  # inside description strings. Do not write a secrets.* example here — the
+  # runner tries to evaluate it and fails with "Unrecognized named-value:
+  # 'secrets'" before the action loads. See the README for usage examples.
   anthropic_api_key:
-    description: 'Anthropic API key. Store it as a repository secret and pass it as ${{ secrets.ANTHROPIC_API_KEY }}. Never hard-code it in the workflow.'
+    description: 'Anthropic API key. Store it as a repository secret and reference that secret from your workflow. Never hard-code it.'
     required: true
   config_path:
     description: 'Path (relative to the repository root) of the review config file.'
